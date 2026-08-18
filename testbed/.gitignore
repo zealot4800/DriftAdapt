@@ -1,0 +1,4 @@
+sendrecv/__pyache__/
+software/__pyache__/
+*.py[cod]
+*.log

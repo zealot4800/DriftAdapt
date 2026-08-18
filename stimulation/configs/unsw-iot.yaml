@@ -1,0 +1,26 @@
+dataset:
+  name: unsw-iot
+  files: [../data/unsw-iot.csv]
+  # Preserve original per-workload standardization after CSV consolidation.
+  preprocessing_segments: [6000, 108000]
+  feature_names:
+    [Dur, SrcBytes, DstBytes, sTtl, dTtl, SrcLoad, DstLoad, SrcPkts,
+     DstPkts, sMeanPktSz, dMeanPktSz, SIntPkt, DIntPkt, TcpRtt, SynAck, AckDat]
+  label_column: label
+  generated_label_column: generated_label
+  num_classes: 10
+  standardize: true
+  normalize: false
+model:
+  class: UNSW_IoT_N3IC
+  kwargs: {input_shape: 16, neurons: [64, 32, 10]}
+  checkpoint: ../checkpoint/unsw-iot-in-network-dnn-5-classes.pt
+labeler: {type: device_list}
+stream: {window_size: 1000, batch_size: 1}
+training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: false}
+# Retrain only when the labeler-based proxy indicates traffic drift.
+trigger:
+  type: accuracy_proxy
+  threshold: 0.30
+runtime: {device: cuda, seed: 42}
+output: {directory: results}
