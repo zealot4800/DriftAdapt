@@ -1,0 +1,63 @@
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Vivado/Xilinx generated state and hardware products
+.Xil/
+*.jou
+*.log
+*.str
+*.pb
+*.wdb
+*.dcp
+*.bit
+*.bin
+*.ltx
+*.hwdef
+*.xpr
+*.xsa
+*.runs/
+*.cache/
+*.gen/
+*.srcs/
+*.sim/
+xsim.dir/
+*_CongestedCLBsAndNets.txt
+tight_setup_hold_pins.txt
+usage_statistics_webtalk.*
+webtalk.*
+
+# DriftAdapt U55C outputs are reproducible through build_u55c.sh
+testbed/hardware/u55c/build/
+
+# Runtime output
+*.pid
+*.pid.lock
+*.tmp
+*.bak

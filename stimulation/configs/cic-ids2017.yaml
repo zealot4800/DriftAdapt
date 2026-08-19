@@ -1,0 +1,30 @@
+dataset:
+  name: cic-ids2017
+  files: [../data/cic-ids2017.csv]
+  # Preserve original per-workload standardization after CSV consolidation.
+  preprocessing_segments: [7000, 9000]
+  feature_names:
+    [Flow IAT Min, Flow IAT Max, Flow IAT Mean, Min Packet Length,
+     Max Packet Length, Packet Length Mean, total packet length,
+     number of packets, SYN Flag Count, ACK Flag Count, PSH Flag Count,
+     FIN Flag Count, RST Flag Count, ECE Flag Count, Flow Duration,
+     Destination Port]
+  label_column: label
+  num_classes: 2
+  standardize: true
+  normalize: false
+model:
+  class: ID_CIC_IDS2017_small_pforest
+  checkpoint: ../checkpoint/cic-ids2017-in-network-dnn.pt
+labeler:
+  type: dnn
+  class: ID_CIC_IDS2017_large_pforest
+  checkpoint: ../checkpoint/cic-ids2017-labeler-dnn.pt
+stream: {window_size: 100, batch_size: 1}
+training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: true}
+# Retrain only when the labeler-based proxy indicates traffic drift.
+trigger:
+  type: accuracy_proxy
+  threshold: 0.20
+runtime: {device: cuda, seed: 42}
+output: {directory: results}
