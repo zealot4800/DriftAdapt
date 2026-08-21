@@ -57,6 +57,7 @@ webtalk.*
 testbed/hardware/u55c/build/
 
 # Runtime output
+testbed/results/
 *.pid
 *.pid.lock
 *.tmp

@@ -1,9 +1,12 @@
 `timescale 1ns/1ps
 
-// BAR2 user block at 0x100000. Software writes all 182 shadow parameters and
-// then writes bit 0 at offset 0x008. The axis domain copies the stable bundled
-// data only after the synchronized commit toggle changes.
-module driftadapt_control_regs (
+// Read-only diagnostic mirror on the OpenNIC user AXI-Lite aperture. The
+// writable CARAVAN window protocol is implemented by driftadapt_window_manager
+// on the private JTAG AXI path.
+module driftadapt_control_regs #(
+    parameter integer DATASET_COUNT = 16000,
+    parameter integer AXIS_CLOCK_HZ = 250000000
+) (
     input  wire          s_axil_awvalid,
     input  wire [31:0]   s_axil_awaddr,
     output wire          s_axil_awready,
@@ -23,95 +26,143 @@ module driftadapt_control_regs (
     input  wire          axil_aclk,
     input  wire          axil_aresetn,
 
-    output wire [5823:0] weight_shadow_axil,
-    output reg           commit_toggle_axil,
-    input  wire          commit_ack_axis,
-    input  wire          weights_loaded_axis,
+    input  wire          generator_active_axis,
+    input  wire          generator_finished_axis,
+    input  wire          result_complete_axis,
+    input  wire [63:0]   sent_packets_axis,
+    input  wire [63:0]   received_packets_axis,
+    input  wire [63:0]   valid_packets_axis,
+    input  wire [63:0]   true_positive_axis,
+    input  wire [63:0]   true_negative_axis,
+    input  wire [63:0]   false_positive_axis,
+    input  wire [63:0]   false_negative_axis,
+    input  wire [63:0]   malformed_packets_axis,
+    input  wire [63:0]   ignored_packets_axis,
     input  wire [63:0]   classified_packets_axis,
-    input  wire [63:0]   bypassed_packets_axis
+    input  wire [63:0]   elapsed_cycles_axis,
+    input  wire [63:0]   input_stall_cycles_axis,
+    input  wire [63:0]   output_stall_cycles_axis,
+    input  wire [63:0]   classifier_busy_cycles_axis,
+    input  wire [63:0]   latency_sum_cycles_axis,
+    input  wire [63:0]   latency_min_cycles_axis,
+    input  wire [63:0]   latency_max_cycles_axis,
+    input  wire [63:0]   first_input_cycle_axis,
+    input  wire [63:0]   last_output_cycle_axis,
+    input  wire [63:0]   total_cycles_axis
 );
     localparam [31:0] FEATURE_WORD = 32'h44524654; // "DRFT"
-    localparam integer PARAM_COUNT = 182;
-    localparam [11:0] WEIGHT_BASE = 12'h010;
+    localparam [31:0] VERSION_WORD = 32'h00040001; // online-window ABI v4.1
+    localparam [31:0] BENCHMARK_MODE = 32'h00000002; // hybrid control plane
+    localparam [31:0] FEATURE_BYTES = 32'd32; // sixteen signed Q8.8 values
+    localparam [31:0] FRAME_BYTES = 32'd60;
 
-    reg [31:0] weight_shadow [0:PARAM_COUNT-1];
-    reg        aw_pending;
-    reg [11:0] awaddr_pending;
-    reg        w_pending;
-    reg [31:0] wdata_pending;
-    integer index;
+    reg aw_pending;
+    reg w_pending;
 
-    (* ASYNC_REG = "TRUE" *) reg commit_ack_meta, commit_ack_axil;
-    (* ASYNC_REG = "TRUE" *) reg weights_loaded_meta, weights_loaded_axil;
+    (* ASYNC_REG = "TRUE" *) reg generator_active_meta, generator_active_axil;
+    (* ASYNC_REG = "TRUE" *) reg generator_finished_meta, generator_finished_axil;
+    (* ASYNC_REG = "TRUE" *) reg result_complete_meta, result_complete_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] sent_meta, sent_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] received_meta, received_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] valid_meta, valid_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] tp_meta, tp_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] tn_meta, tn_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] fp_meta, fp_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] fn_meta, fn_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] malformed_meta, malformed_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] ignored_meta, ignored_axil;
     (* ASYNC_REG = "TRUE" *) reg [63:0] classified_meta, classified_axil;
-    (* ASYNC_REG = "TRUE" *) reg [63:0] bypassed_meta, bypassed_axil;
-
-    wire commit_busy = commit_toggle_axil != commit_ack_axil;
-
-    generate
-        genvar parameter_index;
-        for (parameter_index = 0; parameter_index < PARAM_COUNT; parameter_index = parameter_index + 1) begin : flatten_parameters
-            assign weight_shadow_axil[parameter_index*32 +: 32] = weight_shadow[parameter_index];
-        end
-    endgenerate
+    (* ASYNC_REG = "TRUE" *) reg [63:0] elapsed_meta, elapsed_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] input_stall_meta, input_stall_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] output_stall_meta, output_stall_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] busy_meta, busy_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] latency_sum_meta, latency_sum_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] latency_min_meta, latency_min_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] latency_max_meta, latency_max_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] first_input_meta, first_input_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] last_output_meta, last_output_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] total_cycles_meta, total_cycles_axil;
 
     assign s_axil_awready = axil_aresetn && !aw_pending && !s_axil_bvalid;
-    assign s_axil_wready  = axil_aresetn && !w_pending && !s_axil_bvalid;
-    assign s_axil_bresp   = 2'b00;
+    assign s_axil_wready = axil_aresetn && !w_pending && !s_axil_bvalid;
+    assign s_axil_bresp = 2'b00;
     assign s_axil_arready = axil_aresetn && !s_axil_rvalid;
-    assign s_axil_rresp   = 2'b00;
+    assign s_axil_rresp = 2'b00;
 
     function automatic [31:0] read_register(input [11:0] address);
-        integer parameter_number;
         begin
-            read_register = 32'd0;
             case (address)
                 12'h000: read_register = FEATURE_WORD;
-                12'h004: read_register = {30'd0, commit_busy, weights_loaded_axil};
-                12'h008: read_register = {31'd0, commit_toggle_axil};
-                12'h300: read_register = classified_axil[31:0];
-                12'h304: read_register = classified_axil[63:32];
-                12'h308: read_register = bypassed_axil[31:0];
-                12'h30c: read_register = bypassed_axil[63:32];
-                default: begin
-                    if (address >= WEIGHT_BASE && address < WEIGHT_BASE + PARAM_COUNT*4 && address[1:0] == 2'b00) begin
-                        parameter_number = (address - WEIGHT_BASE) >> 2;
-                        read_register = weight_shadow[parameter_number];
-                    end
-                end
+                12'h004: read_register = {
+                    28'd0, result_complete_axil, generator_finished_axil,
+                    generator_active_axil, 1'b1
+                };
+                12'h008: read_register = VERSION_WORD;
+                12'h00c: read_register = DATASET_COUNT;
+                12'h010: read_register = AXIS_CLOCK_HZ;
+                12'h014: read_register = BENCHMARK_MODE;
+                12'h018: read_register = FEATURE_BYTES;
+                12'h01c: read_register = FRAME_BYTES;
+                12'h020: read_register = sent_axil[31:0];
+                12'h024: read_register = sent_axil[63:32];
+                12'h028: read_register = received_axil[31:0];
+                12'h02c: read_register = received_axil[63:32];
+                12'h030: read_register = valid_axil[31:0];
+                12'h034: read_register = valid_axil[63:32];
+                12'h038: read_register = tp_axil[31:0];
+                12'h03c: read_register = tp_axil[63:32];
+                12'h040: read_register = tn_axil[31:0];
+                12'h044: read_register = tn_axil[63:32];
+                12'h048: read_register = fp_axil[31:0];
+                12'h04c: read_register = fp_axil[63:32];
+                12'h050: read_register = fn_axil[31:0];
+                12'h054: read_register = fn_axil[63:32];
+                12'h058: read_register = malformed_axil[31:0];
+                12'h05c: read_register = malformed_axil[63:32];
+                12'h060: read_register = ignored_axil[31:0];
+                12'h064: read_register = ignored_axil[63:32];
+                12'h068: read_register = classified_axil[31:0];
+                12'h06c: read_register = classified_axil[63:32];
+                12'h070: read_register = elapsed_axil[31:0];
+                12'h074: read_register = elapsed_axil[63:32];
+                12'h078: read_register = input_stall_axil[31:0];
+                12'h07c: read_register = input_stall_axil[63:32];
+                12'h080: read_register = output_stall_axil[31:0];
+                12'h084: read_register = output_stall_axil[63:32];
+                12'h088: read_register = busy_axil[31:0];
+                12'h08c: read_register = busy_axil[63:32];
+                12'h090: read_register = latency_sum_axil[31:0];
+                12'h094: read_register = latency_sum_axil[63:32];
+                12'h098: read_register = latency_min_axil[31:0];
+                12'h09c: read_register = latency_min_axil[63:32];
+                12'h0a0: read_register = latency_max_axil[31:0];
+                12'h0a4: read_register = latency_max_axil[63:32];
+                12'h0a8: read_register = first_input_axil[31:0];
+                12'h0ac: read_register = first_input_axil[63:32];
+                12'h0b0: read_register = last_output_axil[31:0];
+                12'h0b4: read_register = last_output_axil[63:32];
+                12'h0b8: read_register = total_cycles_axil[31:0];
+                12'h0bc: read_register = total_cycles_axil[63:32];
+                default: read_register = 32'd0;
             endcase
         end
     endfunction
 
+    // Writes are acknowledged and intentionally ignored on this diagnostic
+    // mirror. Window labels and shadow weights use the private JTAG block.
     always @(posedge axil_aclk) begin
         if (!axil_aresetn) begin
             aw_pending <= 1'b0;
-            awaddr_pending <= 12'd0;
             w_pending <= 1'b0;
-            wdata_pending <= 32'd0;
             s_axil_bvalid <= 1'b0;
             s_axil_rvalid <= 1'b0;
             s_axil_rdata <= 32'd0;
-            commit_toggle_axil <= 1'b0;
-            for (index = 0; index < PARAM_COUNT; index = index + 1)
-                weight_shadow[index] <= 32'd0;
         end else begin
-            if (s_axil_awvalid && s_axil_awready) begin
+            if (s_axil_awvalid && s_axil_awready)
                 aw_pending <= 1'b1;
-                awaddr_pending <= s_axil_awaddr[11:0];
-            end
-            if (s_axil_wvalid && s_axil_wready) begin
+            if (s_axil_wvalid && s_axil_wready)
                 w_pending <= 1'b1;
-                wdata_pending <= s_axil_wdata;
-            end
             if (aw_pending && w_pending && !s_axil_bvalid) begin
-                if (awaddr_pending == 12'h008 && wdata_pending[0]) begin
-                    commit_toggle_axil <= ~commit_toggle_axil;
-                end else if (awaddr_pending >= WEIGHT_BASE &&
-                             awaddr_pending < WEIGHT_BASE + PARAM_COUNT*4 &&
-                             awaddr_pending[1:0] == 2'b00) begin
-                    weight_shadow[(awaddr_pending - WEIGHT_BASE) >> 2] <= wdata_pending;
-                end
                 aw_pending <= 1'b0;
                 w_pending <= 1'b0;
                 s_axil_bvalid <= 1'b1;
@@ -130,23 +181,66 @@ module driftadapt_control_regs (
 
     always @(posedge axil_aclk) begin
         if (!axil_aresetn) begin
-            commit_ack_meta <= 1'b0;
-            commit_ack_axil <= 1'b0;
-            weights_loaded_meta <= 1'b0;
-            weights_loaded_axil <= 1'b0;
-            classified_meta <= 64'd0;
-            classified_axil <= 64'd0;
-            bypassed_meta <= 64'd0;
-            bypassed_axil <= 64'd0;
+            generator_active_meta <= 0; generator_active_axil <= 0;
+            generator_finished_meta <= 0; generator_finished_axil <= 0;
+            result_complete_meta <= 0; result_complete_axil <= 0;
+            sent_meta <= 0; sent_axil <= 0;
+            received_meta <= 0; received_axil <= 0;
+            valid_meta <= 0; valid_axil <= 0;
+            tp_meta <= 0; tp_axil <= 0;
+            tn_meta <= 0; tn_axil <= 0;
+            fp_meta <= 0; fp_axil <= 0;
+            fn_meta <= 0; fn_axil <= 0;
+            malformed_meta <= 0; malformed_axil <= 0;
+            ignored_meta <= 0; ignored_axil <= 0;
+            classified_meta <= 0; classified_axil <= 0;
+            elapsed_meta <= 0; elapsed_axil <= 0;
+            input_stall_meta <= 0; input_stall_axil <= 0;
+            output_stall_meta <= 0; output_stall_axil <= 0;
+            busy_meta <= 0; busy_axil <= 0;
+            latency_sum_meta <= 0; latency_sum_axil <= 0;
+            latency_min_meta <= 0; latency_min_axil <= 0;
+            latency_max_meta <= 0; latency_max_axil <= 0;
+            first_input_meta <= 0; first_input_axil <= 0;
+            last_output_meta <= 0; last_output_axil <= 0;
+            total_cycles_meta <= 0; total_cycles_axil <= 0;
         end else begin
-            commit_ack_meta <= commit_ack_axis;
-            commit_ack_axil <= commit_ack_meta;
-            weights_loaded_meta <= weights_loaded_axis;
-            weights_loaded_axil <= weights_loaded_meta;
-            classified_meta <= classified_packets_axis;
-            classified_axil <= classified_meta;
-            bypassed_meta <= bypassed_packets_axis;
-            bypassed_axil <= bypassed_meta;
+            generator_active_meta <= generator_active_axis;
+            generator_active_axil <= generator_active_meta;
+            generator_finished_meta <= generator_finished_axis;
+            generator_finished_axil <= generator_finished_meta;
+            result_complete_meta <= result_complete_axis;
+            result_complete_axil <= result_complete_meta;
+            sent_meta <= sent_packets_axis; sent_axil <= sent_meta;
+            received_meta <= received_packets_axis; received_axil <= received_meta;
+            valid_meta <= valid_packets_axis; valid_axil <= valid_meta;
+            tp_meta <= true_positive_axis; tp_axil <= tp_meta;
+            tn_meta <= true_negative_axis; tn_axil <= tn_meta;
+            fp_meta <= false_positive_axis; fp_axil <= fp_meta;
+            fn_meta <= false_negative_axis; fn_axil <= fn_meta;
+            malformed_meta <= malformed_packets_axis; malformed_axil <= malformed_meta;
+            ignored_meta <= ignored_packets_axis; ignored_axil <= ignored_meta;
+            classified_meta <= classified_packets_axis; classified_axil <= classified_meta;
+            elapsed_meta <= elapsed_cycles_axis; elapsed_axil <= elapsed_meta;
+            input_stall_meta <= input_stall_cycles_axis;
+            input_stall_axil <= input_stall_meta;
+            output_stall_meta <= output_stall_cycles_axis;
+            output_stall_axil <= output_stall_meta;
+            busy_meta <= classifier_busy_cycles_axis; busy_axil <= busy_meta;
+            latency_sum_meta <= latency_sum_cycles_axis;
+            latency_sum_axil <= latency_sum_meta;
+            latency_min_meta <= latency_min_cycles_axis;
+            latency_min_axil <= latency_min_meta;
+            latency_max_meta <= latency_max_cycles_axis;
+            latency_max_axil <= latency_max_meta;
+            first_input_meta <= first_input_cycle_axis;
+            first_input_axil <= first_input_meta;
+            last_output_meta <= last_output_cycle_axis;
+            last_output_axil <= last_output_meta;
+            total_cycles_meta <= total_cycles_axis;
+            total_cycles_axil <= total_cycles_meta;
         end
     end
+
+    wire unused_write_data = ^{s_axil_awaddr, s_axil_wdata};
 endmodule

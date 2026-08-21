@@ -16,7 +16,7 @@ model:
   kwargs: {input_shape: 16, neurons: [64, 32, 10]}
   checkpoint: ../checkpoint/unsw-iot-in-network-dnn-5-classes.pt
 labeler: {type: device_list}
-stream: {window_size: 1000, batch_size: 1}
+stream: {window_size: 1000}
 training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: false}
 # Retrain only when the labeler-based proxy indicates traffic drift.
 trigger:

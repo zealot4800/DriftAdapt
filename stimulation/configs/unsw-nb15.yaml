@@ -15,7 +15,7 @@ model:
   checkpoint: ../checkpoint/unsw-nb15-in-network-dnn.pt
 labeler:
   type: ollama
-stream: {window_size: 100, batch_size: 1}
+stream: {window_size: 100}
 training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: true}
 # Retrain only when the labeler-based proxy indicates traffic drift.
 trigger:

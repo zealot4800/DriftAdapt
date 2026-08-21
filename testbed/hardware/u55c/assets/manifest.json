@@ -1,0 +1,21 @@
+{
+  "format_version": 2,
+  "sample_count": 16000,
+  "feature_count": 16,
+  "parameter_count": 182,
+  "feature_format": "signed Q8.8",
+  "sample_record": "sixteen features; no label",
+  "parameter_format": "signed Q16.16",
+  "checkpoint_sha256": "a34e8dd4f0ff1a46ddaf5e651095616a55cce46704ce62b24657b41f8290ce97",
+  "config_sha256": "cd1ac1b31de72574c870ea5f252153e1431cf0d6c4e88436e086c5c33d37c395",
+  "weights_sha256": "790c5571b342a119e8a6d644656f7118d1047d04e21842361301482cb38fc1fd",
+  "samples_sha256": "826ce265ba6e4ec81a07df104e0c0128935b82594b5f39f08d27b344adb4d24b",
+  "expected": {
+    "true_positive": 5848,
+    "true_negative": 882,
+    "false_positive": 7118,
+    "false_negative": 2152,
+    "correct": 6730,
+    "accuracy": 0.420625
+  }
+}

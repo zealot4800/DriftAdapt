@@ -1,120 +1,126 @@
-# DRIFTADAPT hardware deployment
+# DRIFTADAPT U55C online-learning testbed
 
-This directory runs DRIFTADAPT on the Alveo U55C installed in this host. The
-U55C implementation is a Vivado 2022.2 OpenNIC design with two 100GbE/RS-FEC
-ports and a 16-8-4-2 fixed-point DNN in the PF0 transmit path.
-
-The runtime packet path is:
+The testbed follows CARAVAN's data-plane/control-plane split:
 
 ```text
-sender on PF0 -> DNN -> QSFP0 -> external byte-preserving forwarder
-                                    -> QSFP1 -> receiver on PF1
+FPGA sample source -> fixed-point DNN -> prediction window A/B
+                                           |
+                                  private JTAG AXI
+                                           |
+local labeling agent -> generated labels -> accuracy proxy -> drift trigger
+                                                        |
+                                                retrain student DNN
+                                                        |
+                                      shadow weights -> atomic FPGA commit
 ```
 
-The forwarder must return the complete Ethernet frame unchanged. In
-particular, it must preserve bytes 14 through 48. A direct 100GbE/RS-FEC
-loopback between QSFP0 and QSFP1 can be used instead.
+Every completed window contains the sixteen Q8.8 features, a monotonically
+increasing sample identifier, the FPGA prediction, and its logit margin. The
+local agent produces exactly one binary generated label for every sample. The
+FPGA independently reconstructs TP/TN/FP/FN from returned labels and data-plane
+predictions; the host verifies those counters and calculates macro F1:
 
-## Software environment
+```text
+accuracy_proxy[k] = macro_F1(fpga_predictions[k], agent_labels[k])
+```
 
-Use the Python environment shared with stimulation:
+Drift is signaled by a configured temporal proxy drop or by the proxy remaining
+below its minimum for consecutive windows. Only then is a class-balanced
+student model retrained. All 182 Q16.16 parameters are staged in the inactive
+FPGA bank and committed together at an inference boundary.
+
+The committed sample memory contains features only. Dataset labels are used
+while generating the offline manifest, but are not written into the synthesized
+traffic ROM and cannot influence online validation.
+
+## 1. Regenerate assets when preprocessing or checkpoints change
 
 ```bash
-cd /home/zealot/DriftAdapt/stimulation
-source .venv/bin/activate
-python -m pip install -r requirements.txt -r ../testbed/requirements.txt
-
-cd ../testbed
-set -a
-source .env
-set +a
-python scripts/preflight.py
+cd /home/zealot/DriftAdapt/testbed
+../stimulation/.venv/bin/python \
+  hardware/u55c/scripts/generate_fpga_assets.py
 ```
 
-Before programming, preflight is expected to report the U55C XRT personality
-(`10ee:505c/505d`) and missing OpenNIC interfaces. That is a safety check, not
-a reason to change the PCI IDs in the code.
-
-The model paths and adaptation settings in `.env` match
-`stimulation/configs/cic-ids2017.yaml`. Regenerate the packet workload after
-changing stimulation preprocessing:
-
-```bash
-../stimulation/.venv/bin/python ../stimulation/export_testbed.py \
-  --config ../stimulation/configs/cic-ids2017.yaml \
-  --output sendrecv/data/intrusion-detection.csv
-```
-
-## Build the U55C image
-
-The build consumes the existing OpenNIC checkout at
-`/home/zealot/FTC/third_party/open-nic-shell` and does not program hardware:
+## 2. Build with the existing Vivado 2022.2 installation
 
 ```bash
 cd /home/zealot/DriftAdapt/testbed
 bash hardware/u55c/scripts/build_u55c.sh all
 ```
 
-The command must complete synthesis, implementation, routing, DRC, setup/hold
-timing, and bitstream generation. Reports are written to
-`hardware/u55c/build/`. The accepted timing-closed image and its final reports
-are under `hardware/u55c/build/closure/`. See `hardware/u55c/README.md` for
-the BAR2 register map.
+The isolated OpenNIC build tag is `driftadapt_online_windows_v4_1`. The validated
+image is written to:
 
-Programming is deliberately a separate, confirmed operation because it takes
-both U55C PCI functions offline and replaces the currently loaded image. Do
-not run the adaptive control plane against an image that does not expose the
-`DRFT` feature word at BAR2 offset `0x100000`.
-
-After the build passes, validate the programming inputs with
-`hardware/u55c/scripts/bringup_u55c.sh --dry-run`. Running the script without
-`--dry-run` requires an explicit interactive confirmation, programs through
-JTAG, rescans PCIe, loads the matching OpenNIC driver with RS-FEC, validates
-both links, and prints the resolved interface names.
-
-## Configure the programmed card
-
-After programming and PCIe rescan, load the matching OpenNIC module with
-RS-FEC enabled. Resolve interface names from the PCI functions instead of
-guessing them:
-
-```bash
-tx_iface=$(basename /sys/bus/pci/devices/0000:01:00.0/net/*)
-rx_iface=$(basename /sys/bus/pci/devices/0000:01:00.1/net/*)
-sudo ip link set dev "$rx_iface" up
-sudo ip link set dev "$tx_iface" up
-sudo ethtool "$tx_iface"
-sudo ethtool "$rx_iface"
+```text
+hardware/u55c/build/closure/driftadapt_u55c_timing_closed.bit
 ```
 
-Both links must report `Link detected: yes`. Put the resolved names in
-`DRIFTADAPT_TX_IFACE` and `DRIFTADAPT_RX_IFACE`, then rerun preflight. InfluxDB 1.x
-must contain the `basic_tcp` measurement used by the adaptive control plane;
-use `--skip-influx` only for packet-path bring-up.
+## 3. Program safely
 
-The final post-program preflight must run with `sudo --preserve-env` because
-the PCI resource is root-readable only. It verifies the `DRFT` feature word,
-not just the generic OpenNIC PCI ID.
-
-## Run DRIFTADAPT
-
-Use three terminals after preflight passes:
+The OpenNIC module must not be bound while the FPGA is replaced:
 
 ```bash
-# Terminal 1: receive returned predictions
-sudo ../stimulation/.venv/bin/python sendrecv/receiver.py \
-  --iface "$DRIFTADAPT_RX_IFACE" --logfile receiver-f1.log
+sudo modprobe -r onic
 
-# Terminal 2: load weights and run online adaptation
-sudo --preserve-env \
-  ../stimulation/.venv/bin/python software/intrusion-detection.py
-
-# Terminal 3: inject CIC flows
-sudo ../stimulation/.venv/bin/python sendrecv/sender.py \
-  --iface "$DRIFTADAPT_TX_IFACE" \
-  --datafile sendrecv/data/intrusion-detection.csv
+cd /home/zealot/DriftAdapt/testbed
+bash hardware/u55c/scripts/program_u55c.sh --dry-run
+bash hardware/u55c/scripts/program_u55c.sh
 ```
 
-Raw packets and BAR access require root. The control plane validates the U55C
-feature word before its first register write and commits all 182 Q16.16 model
-parameters atomically.
+The FPGA fills at most two windows and then applies backpressure until the
+local agent returns labels. No OpenNIC driver, Linux network interface,
+InfluxDB service, packet sender/receiver, optical cable, or reboot is required.
+
+## 4. Run the local labeling agent
+
+Do not run the result reader concurrently because both commands use the same
+private JTAG AXI master.
+
+```bash
+cd /home/zealot/DriftAdapt/testbed
+../stimulation/.venv/bin/python -u \
+  hardware/u55c/scripts/run_online_adaptation.py \
+  --config ../stimulation/configs/cic-ids2017.yaml \
+  --device cpu
+```
+
+The hardware controller defaults to the local Ollama agent (`--provider local`)
+and uses the raw feature values associated with each FPGA sample ID. It reads
+only configured feature columns and never reads the CSV ground-truth column.
+Before that run, start Ollama and ensure the configured local model is present;
+the defaults are `OLLAMA_HOST=http://127.0.0.1:11434` and
+`OLLAMA_MODEL=llama2:7b`. The controller loads `stimulation/.env`, and either
+setting can also be supplied directly as an environment variable.
+For a deterministic labeler smoke run, select the large checkpoint DNN with
+`--provider dnn`. In both cases the agent labels every sample.
+
+For a one-window hardware smoke run without retraining:
+
+```bash
+../stimulation/.venv/bin/python -u \
+  hardware/u55c/scripts/run_online_adaptation.py \
+  --provider dnn --max-windows 1 --no-retrain
+```
+
+Per-window proxy values, drift decisions, labeling/retraining time, confusion
+counters, and model versions are written to `testbed/results/`.
+
+## 5. Read final accuracy-proxy and performance state
+
+After stopping or completing the agent:
+
+```bash
+python3 hardware/u55c/scripts/read_fpga_results.py
+```
+
+Machine-readable output:
+
+```bash
+python3 hardware/u55c/scripts/read_fpga_results.py --json
+```
+
+`closed_loop_throughput_samples_per_second` spans the first FPGA input through
+the final agent label and includes window backpressure, labeling, and
+retraining. `classifier_throughput_samples_per_second` and `mean_latency_ns`
+isolate the data-plane DNN. Thus the report separates inference performance
+from end-to-end online-adaptation throughput.

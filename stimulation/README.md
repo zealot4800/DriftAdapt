@@ -85,12 +85,13 @@ artifact and then concatenated in listed temporal order. This is a drift-only
 implementation: every configuration requires the `accuracy_proxy` trigger.
 There is no continuous or fixed-frequency retraining path.
 
-For each window, DRIFTADAPT compares the current student's predictions with labels
-from its labeling agent. It fully retrains only when that proxy F1 is below the
-configured threshold and the labeled training set is usable. Binary workloads
-use the artifact's random undersampling to form a balanced online set. Every
-parameter remains trainable. Multiclass IoT workloads use all device-list-
-matched samples without binary balancing.
+For each window, DRIFTADAPT compares the current student's predictions with
+labels from its labeling agent. It retrains after a configured abrupt temporal
+drop in proxy F1, or after proxy F1 remains below the minimum threshold for the
+configured number of consecutive windows. Binary workloads use the artifact's
+random undersampling to form a balanced online set. Every parameter remains
+trainable. Multiclass IoT workloads use all device-list-matched samples without
+binary balancing.
 
 ## CIC-IDS2017 traffic-drift run
 
@@ -104,24 +105,22 @@ segment lengths preserve the artifact's original per-workload standardization.
 python run.py --config configs/cic-ids2017.yaml
 ```
 
-To regenerate the packet workload consumed by the FPGA sender from this exact
-feature order and per-segment preprocessing:
+To regenerate the feature and model memories consumed by the U55C image:
 
 ```bash
-python export_testbed.py --config configs/cic-ids2017.yaml \
-  --output ../testbed/sendrecv/data/intrusion-detection.csv
+../stimulation/.venv/bin/python \
+  ../testbed/hardware/u55c/scripts/generate_fpga_assets.py
 ```
 
 This configuration uses the DNN labeling agent to calculate the student's
-accuracy-proxy F1. Retraining is requested only when proxy F1 is below `0.20`.
-That cutoff was selected from the unchanged pretrained model: 0 of 70 windows
-in workload 1 and 18 of 90 windows in workload 2 fall below it before online
-adaptation. Ground-truth labels are used only for reporting `student_f1` and
-are not used by the trigger or DRIFTADAPT training.
+accuracy-proxy F1. The minimum proxy is `0.20`, the abrupt-drop threshold is
+`0.15`, and two consecutive low-proxy windows are required. Ground-truth labels
+are used only for simulation reporting and offline asset verification; they are
+not used by the trigger, hardware window manager, or online training.
 
 ## Provenance and scope
 
 Reference: [Per-Packet-AI/DriftAdapt-Artifact-OSDI24](https://github.com/Per-Packet-AI/DriftAdapt-Artifact-OSDI24).
-The implementation deliberately excludes rule caching, plotting, P4/FPGA
-code, notebooks, artifact figure drivers, and any selective or partial
-retraining extensions.
+The implementation deliberately excludes rule caching, plotting, P4 programs,
+notebooks, artifact figure drivers, and selective or partial retraining. The
+U55C integration is documented in `../testbed/README.md`.

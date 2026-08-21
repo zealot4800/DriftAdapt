@@ -20,11 +20,13 @@ labeler:
   type: dnn
   class: ID_CIC_IDS2017_large_pforest
   checkpoint: ../checkpoint/cic-ids2017-labeler-dnn.pt
-stream: {window_size: 100, batch_size: 1}
+stream: {window_size: 100}
 training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: true}
 # Retrain only when the labeler-based proxy indicates traffic drift.
 trigger:
   type: accuracy_proxy
   threshold: 0.20
+  drop_threshold: 0.15
+  consecutive_windows: 2
 runtime: {device: cuda, seed: 42}
 output: {directory: results}

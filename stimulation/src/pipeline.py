@@ -38,7 +38,6 @@ class DriftAdaptPipeline:
         load_checkpoint(self.model, str(checkpoint), self.device)
         self.model.eval()
         self.static_model = copy.deepcopy(self.model).eval()
-        self.oracle_model = copy.deepcopy(self.model).eval() if config.get("oracle", {}).get("enabled") else None
 
         labeler_config = copy.deepcopy(config["labeler"])
         labeler_config.setdefault("feature_names", dataset_config["feature_names"])
@@ -49,7 +48,11 @@ class DriftAdaptPipeline:
         trigger_config = config["trigger"]
         if trigger_config.get("type") != "accuracy_proxy":
             raise ValueError("This drift-only implementation requires trigger.type: accuracy_proxy")
-        self.trigger = RetrainingTrigger(threshold=float(trigger_config["threshold"]))
+        self.trigger = RetrainingTrigger(
+            threshold=float(trigger_config["threshold"]),
+            drop_threshold=float(trigger_config.get("drop_threshold", 0.15)),
+            consecutive_windows=int(trigger_config.get("consecutive_windows", 2)),
+        )
         self.base_dir = base
 
     @torch.inference_mode()
@@ -65,7 +68,6 @@ class DriftAdaptPipeline:
         for index, window in enumerate(self.dataset.windows(int(stream["window_size"])), start=1):
             student_labels = self._predict(self.model, window.features)
             static_labels = self._predict(self.static_model, window.features)
-            oracle_labels = self._predict(self.oracle_model, window.features) if self.oracle_model else None
             produced = self.labeler.label(window.features, window.raw_features, window.generated_labels)
 
             if labeler_type == "device_list":
@@ -86,9 +88,7 @@ class DriftAdaptPipeline:
 
             proxy_f1 = macro_f1(labeler_labels, proxy_student)
             static_proxy_f1 = macro_f1(labeler_labels, proxy_static)
-            requested = self.trigger.update(
-                window_index=index, model_proxy_f1=proxy_f1, static_proxy_f1=static_proxy_f1,
-            )
+            requested = self.trigger.update(proxy_f1)
             balanced = bool(training.get("balance_binary", self.config["dataset"]["num_classes"] == 2))
             train_x, train_y = form_training_set(training_features, labeler_labels, balance_binary=balanced)
             retrained = requested and train_x is not None
@@ -113,8 +113,6 @@ class DriftAdaptPipeline:
                 "training_samples": sample_count,
                 "training_time": training_time,
             }
-            if oracle_labels is not None:
-                row["oracle_f1"] = macro_f1(window.labels, oracle_labels)
             rows.append(row)
 
         summary = self._save(rows)

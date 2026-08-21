@@ -5,10 +5,12 @@ hardware_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 open_nic_root=${OPENNIC_ROOT:-/home/zealot/FTC/third_party/open-nic-shell}
 vivado_bin=${VIVADO_BIN:-/home/palhad/Xilinx/Vivado/2022.2/bin/vivado}
 mode=${1:-create}
-tag=driftadapt_dnn_100g
+tag=driftadapt_online_windows_v4_1
 project="$open_nic_root/build/au55c_${tag}/open_nic_shell/open_nic_shell.xpr"
 routed_dcp="$open_nic_root/build/au55c_${tag}/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell_routed.dcp"
 closure_dir="$hardware_root/build/closure"
+weight_mem="$hardware_root/assets/driftadapt_weights.mem"
+sample_mem="$hardware_root/assets/driftadapt_samples.mem"
 
 if [[ "$mode" != "create" && "$mode" != "implement" && "$mode" != "close" && "$mode" != "all" ]]; then
     echo "usage: $0 [create|implement|close|all]" >&2
@@ -16,6 +18,20 @@ if [[ "$mode" != "create" && "$mode" != "implement" && "$mode" != "close" && "$m
 fi
 [[ -x "$vivado_bin" ]] || { echo "Vivado is missing: $vivado_bin" >&2; exit 1; }
 [[ -d "$open_nic_root/script" ]] || { echo "OpenNIC is missing: $open_nic_root" >&2; exit 1; }
+[[ -s "$weight_mem" ]] || { echo "embedded weight ROM is missing: $weight_mem" >&2; exit 1; }
+[[ -s "$sample_mem" ]] || { echo "embedded sample ROM is missing: $sample_mem" >&2; exit 1; }
+[[ $(wc -l < "$weight_mem") -eq 182 ]] || {
+    echo "embedded weight ROM must contain exactly 182 words" >&2
+    exit 1
+}
+[[ $(wc -l < "$sample_mem") -eq 16000 ]] || {
+    echo "embedded sample ROM must contain exactly 16000 words" >&2
+    exit 1
+}
+awk 'length($0) != 64 {exit 1}' "$sample_mem" || {
+    echo "embedded sample ROM words must contain only sixteen Q8.8 features" >&2
+    exit 1
+}
 
 if [[ -z "${XILINXD_LICENSE_FILE:-}" && -r /home/palhad/.Xilinx/licenses/Xilinx.lic ]]; then
     export XILINXD_LICENSE_FILE=/home/palhad/.Xilinx/licenses/Xilinx.lic

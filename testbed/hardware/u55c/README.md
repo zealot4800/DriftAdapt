@@ -1,55 +1,70 @@
-# DRIFTADAPT Alveo U55C port
+# DRIFTADAPT online-window U55C plugin
 
-This port targets the detected `xcu55c-fsvh2892-2L-e` using the existing
-Vivado 2022.2 OpenNIC checkout. It does not modify or program the FTC image.
+## Architecture
 
-The runtime path is host PF0 -> DRIFTADAPT DNN -> QSFP0, then QSFP1 -> host PF1.
-The external device between QSFP0 and QSFP1 must return the Ethernet frame
-unchanged and preserve bytes 14 through 48. A direct QSFP0-to-QSFP1 loop is
-also valid. Both links use 100GbE CAUI-4 with integrated RS-FEC.
-
-The DNN shares one registered 32-bit multiplier across its 168 MACs. A valid
-single-beat feature packet therefore takes 672 cycles (2.688 microseconds at
-250 MHz). This is intentionally optimized for timing-safe experiment traffic,
-not minimum-size 100GbE line rate.
-
-The BAR2 user block begins at `0x100000`: feature word `DRFT` at `+0x000`,
-status at `+0x004`, commit at `+0x008`, 182 Q16.16 parameters at `+0x010`,
-and classified/bypassed packet counters at `+0x300/+0x308`.
-
-Create the project without programming hardware:
-
-```bash
-bash scripts/build_u55c.sh create
+```text
+driftadapt_packet_generator
+  -> driftadapt_dnn_axis (active/shadow Q16.16 weight banks)
+  -> driftadapt_window_manager (two 100-sample banks)
+       <-> driftadapt_jtag_axi <-> local labeling/retraining agent
+  -> driftadapt_benchmark_metrics
 ```
 
-Run synthesis, implementation, timing closure, routing, DRC, and bitstream
-generation with one command:
+QDMA and CMAC packet paths remain disabled in this reference implementation.
+The private JTAG AXI path transports control-plane windows, returned labels,
+and occasional model updates; it is not part of packet inference.
+
+`driftadapt_window_manager` assigns window and sample IDs and records sixteen
+feature-only values, the data-plane prediction, and
+the absolute logit margin. It refuses a label submission unless every sample
+has a valid agent label. Scoring takes one fabric cycle per sample and frees
+the bank only after its proxy confusion matrix is complete.
+
+## Memory assets
+
+- `assets/driftadapt_samples.mem`: 16,000 reproducible feature-only vectors;
+  no ground-truth label is synthesized into this ROM.
+- `assets/driftadapt_weights.mem`: initial 182-word Q16.16 student model.
+- `assets/manifest.json`: source hashes and offline fixed-point reference.
+
+## Control ABI v4.1
+
+Important registers are:
+
+| Offset | Access | Value |
+|---:|:---:|---|
+| `0x000` | R | feature word `0x44524654` |
+| `0x004` | R | generator/window/label/model status bits |
+| `0x008` | R | ABI `0x00040001` |
+| `0x018` | R | labeling window size |
+| `0x020` | R | ready mask: bit 0 bank A, bit 1 bank B |
+| `0x024..0x038` | R | bank window ID, count, and first sample ID |
+| `0x050..0x068` | R | most recently scored window and TP/TN/FP/FN/matches |
+| `0x06c` | R | number of labeled windows |
+| `0x070` | R | total labeled samples, 64-bit |
+| `0x078` | R | active model version |
+| `0x0d0` | R | first-input through final-label closed-loop cycles, 64-bit |
+| `0x100` | W | submit label bank: bit 0 A, bit 1 B |
+| `0x108` | W | commit a complete shadow model |
+| `0x114` | R/W | expected window ID for the next label-bank submission |
+| `0x1000/0x1100` | R/W | bank A label/valid bitmaps |
+| `0x1200/0x1300` | R/W | bank B label/valid bitmaps |
+| `0x1400/0x1500` | R | bank A/B prediction bitmaps |
+| `0x4000` | R/W | 182 shadow Q16.16 parameters |
+| `0x10000/0x20000` | R | bank A/B records, 64-byte stride |
+
+Each record exposes eight feature words followed by sample ID, prediction, and
+Q16.16 logit margin. Explicit identifiers prevent stale or reordered agent
+responses from being compared with the wrong prediction window.
+
+## Commands
 
 ```bash
-bash scripts/build_u55c.sh all
-```
-
-If implementation already produced the routed checkpoint and only the closure
-step needs to be resumed, use:
-
-```bash
-bash scripts/build_u55c.sh close
-```
-
-Programming is intentionally separate and is allowed only after the complete
-implementation gate passes and the current FPGA image has been preserved.
-
-After a passing build, inspect the exact image and host prerequisites without
-changing hardware:
-
-```bash
-bash scripts/bringup_u55c.sh --dry-run
-```
-
-The real operation requires an interactive `PROGRAM DRIFTADAPT U55C`
-confirmation:
-
-```bash
-bash scripts/bringup_u55c.sh
+cd /home/zealot/DriftAdapt/testbed
+bash hardware/u55c/scripts/build_u55c.sh all
+sudo modprobe -r onic
+bash hardware/u55c/scripts/program_u55c.sh
+../stimulation/.venv/bin/python -u \
+  hardware/u55c/scripts/run_online_adaptation.py
+python3 hardware/u55c/scripts/read_fpga_results.py
 ```

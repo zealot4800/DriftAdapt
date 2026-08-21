@@ -162,7 +162,7 @@ def _classification_prompt(rows: list[list[float]], feature_names: list[str]) ->
         for index, row in enumerate(rows, start=1)
     )
     return (
-        "Classify every UNSW-NB15 network flow below. Label benign traffic 0 and "
+        "Classify every network flow below. Label benign traffic 0 and "
         "malicious traffic 1. Keep input order. Return exactly one label per flow "
         f"in the required labels array.\nColumns: {header}\n{flow_lines}"
     )
