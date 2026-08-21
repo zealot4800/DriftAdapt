@@ -3,7 +3,9 @@
 This directory is a compact implementation of the DRIFTADAPT online-learning
 pipeline from the official OSDI '24 artifact. It contains only streaming data
 loading, the artifact's required MLPs and labelers, retraining triggers,
-full-model training, metrics, official workloads, and official checkpoints.
+full-model training, selective hidden-module adaptation, label-free drift and
+impact localization, bounded trusted labeling/replay, candidate validation,
+metrics, official workloads, and official checkpoints.
 
 ## Install and run
 
@@ -82,16 +84,27 @@ name suffixes so they do not overwrite each other.
 Paths are resolved relative to the YAML file. Multiple files may be listed in
 `dataset.files`; they are independently standardized exactly as in the
 artifact and then concatenated in listed temporal order. This is a drift-only
-implementation: every configuration requires the `accuracy_proxy` trigger.
-There is no continuous or fixed-frequency retraining path.
+implementation: every configuration retains the `accuracy_proxy` trigger for
+the CARAVAN baseline. There is no continuous or fixed-frequency retraining
+path.
 
-For each window, DRIFTADAPT compares the current student's predictions with
-labels from its labeling agent. It retrains after a configured abrupt temporal
-drop in proxy F1, or after proxy F1 remains below the minimum threshold for the
-configured number of consecutive windows. Binary workloads use the artifact's
-random undersampling to form a balanced online set. Every parameter remains
-trainable. Multiclass IoT workloads use all device-list-matched samples without
-binary balancing.
+The independent `drift` configuration controls a label-free feature monitor:
+`bins` fixes the histogram width, `reference_windows` learns and freezes the
+per-feature ranges, and `threshold` plus `consecutive_windows` determine when a
+feature is reported as drifted. This monitor observes only input features.
+Results include per-feature JSD scores, drifted indices and names, and the
+fixed histogram counter/state cost for later hardware sizing.
+
+`driftadapt.mode` selects one of three policies. `baseline_caravan` labels each
+complete window, uses the original accuracy-proxy trigger, and fully retrains
+the active model. `driftadapt_full` and `driftadapt_selective` use persistent
+feature drift, impact localization, and bounded sample selection. Selected
+samples pass through confidence plus embedding-distance OOD knownness; unknown
+samples use the configured fallback. Trusted samples can be combined with
+bounded FIFO replay. Adaptation trains a copied candidate, validates it only on
+trusted labels, and deploys it by incrementing the model version only when the
+validation tolerance is met. Selective candidates always train the classifier
+and fall back to full retraining when impacted coverage is high.
 
 ## CIC-IDS2017 traffic-drift run
 
@@ -102,8 +115,14 @@ boundary during execution; it evaluates every window normally. Configuration
 segment lengths preserve the artifact's original per-workload standardization.
 
 ```bash
-python run.py --config configs/cic-ids2017.yaml
+python run.py --config configs/cic-ids2017.yaml --mode baseline_caravan
+python run.py --config configs/cic-ids2017.yaml --mode driftadapt_full
+python run.py --config configs/cic-ids2017.yaml --mode driftadapt_selective
 ```
+
+The optional CLI flag overrides `driftadapt.mode`; without it, the YAML value
+is used. The previous `--adaptation-mode full|selective` spelling remains as a
+legacy alias for CARAVAN full and DriftAdapt selective respectively.
 
 To regenerate the feature and model memories consumed by the U55C image:
 
@@ -122,5 +141,5 @@ not used by the trigger, hardware window manager, or online training.
 
 Reference: [Per-Packet-AI/DriftAdapt-Artifact-OSDI24](https://github.com/Per-Packet-AI/DriftAdapt-Artifact-OSDI24).
 The implementation deliberately excludes rule caching, plotting, P4 programs,
-notebooks, artifact figure drivers, and selective or partial retraining. The
-U55C integration is documented in `../testbed/README.md`.
+notebooks, artifact figure drivers, and hardware-aware execution. The U55C
+integration is documented in `../testbed/README.md`.

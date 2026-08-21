@@ -17,7 +17,34 @@ labeler:
   type: ollama
 stream: {window_size: 100}
 training: {epochs: 30, batch_size: 512, learning_rate: 0.01, optimizer: Adam, balance_binary: true}
-# Retrain only when the labeler-based proxy indicates traffic drift.
+adaptation:
+  impact_threshold: 0.30
+driftadapt:
+  mode: driftadapt_selective
+  min_labeled_samples: 64
+  full_retrain_threshold: 0.70
+  parameter_bits: 32
+sample_selection: {enabled: true, max_samples: 64}
+labeling:
+  confidence_threshold: 0.95
+  ood_threshold: 0.30
+  fallback: oracle
+replay: {enabled: true, capacity: 1000, samples_per_update: 256}
+validation: {enabled: true, max_f1_drop: 0.02}
+drift:
+  bins: 16
+  threshold: 0.10
+  consecutive_windows: 3
+  reference_windows: 10
+drift_injection:
+  enabled: false
+  start_window: 20
+  end_window: null  # Required for gradual and recurrent drift.
+  type: abrupt
+  feature_indices: [0, 1]
+  feature_names: []
+  magnitude: 2.0
+# Used only by the baseline_caravan accuracy-proxy path.
 trigger:
   type: accuracy_proxy
   threshold: 0.20

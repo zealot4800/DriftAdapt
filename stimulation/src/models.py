@@ -17,6 +17,24 @@ class InferenceModel(nn.Module):
         scores = self.forward(x)
         return scores, torch.argmax(scores, dim=1)
 
+    def named_hidden_modules(self) -> dict[str, nn.Linear]:
+        """Return hidden layers by their checkpoint-compatible module names."""
+        linear_modules = [
+            (name, module) for name, module in self.named_modules()
+            if isinstance(module, nn.Linear)
+        ]
+        return dict(linear_modules[:-1])
+
+    def named_classifier_module(self) -> tuple[str, nn.Linear]:
+        """Return the final classifier and its checkpoint-compatible name."""
+        linear_modules = [
+            (name, module) for name, module in self.named_modules()
+            if isinstance(module, nn.Linear)
+        ]
+        if not linear_modules:
+            raise ValueError("An adaptation model must contain at least one linear layer")
+        return linear_modules[-1]
+
 
 class ID_CIC_IDS2017_small_pforest(InferenceModel):
     def __init__(self) -> None:
