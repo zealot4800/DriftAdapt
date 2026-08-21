@@ -1,11 +1,12 @@
 `timescale 1ns/1ps
 
-// Read-only diagnostic mirror on the OpenNIC user AXI-Lite aperture. The
-// writable CARAVAN window protocol is implemented by driftadapt_window_manager
-// on the private JTAG AXI path.
+// Diagnostic mirror on the OpenNIC user AXI-Lite aperture. Only the histogram
+// read selector is writable here; the CARAVAN window protocol remains on the
+// private JTAG AXI path in driftadapt_window_manager.
 module driftadapt_control_regs #(
     parameter integer DATASET_COUNT = 16000,
-    parameter integer AXIS_CLOCK_HZ = 250000000
+    parameter integer AXIS_CLOCK_HZ = 250000000,
+    parameter integer REFERENCE_WINDOWS = 10
 ) (
     input  wire          s_axil_awvalid,
     input  wire [31:0]   s_axil_awaddr,
@@ -48,7 +49,28 @@ module driftadapt_control_regs #(
     input  wire [63:0]   latency_max_cycles_axis,
     input  wire [63:0]   first_input_cycle_axis,
     input  wire [63:0]   last_output_cycle_axis,
-    input  wire [63:0]   total_cycles_axis
+    input  wire [63:0]   total_cycles_axis,
+    input  wire          hist_reference_ready_axis,
+    input  wire          hist_snapshot_valid_axis,
+    input  wire          hist_overflow_error_axis,
+    input  wire [31:0]   hist_completed_window_id_axis,
+    input  wire [31:0]   hist_completed_window_samples_axis,
+    input  wire [8191:0] hist_reference_flat_axis,
+    input  wire [8191:0] hist_snapshot0_flat_axis,
+    input  wire [8191:0] hist_snapshot1_flat_axis,
+    input  wire [255:0]  hist_range_min_flat_axis,
+    input  wire [255:0]  hist_range_max_flat_axis,
+    input  wire          update_selective_mode_axis,
+    input  wire          update_clone_complete_axis,
+    input  wire          update_verify_error_axis,
+    input  wire [31:0]   update_patched_parameters_axis,
+    input  wire [31:0]   update_bytes_axis,
+    input  wire [63:0]   update_clone_cycles_axis,
+    input  wire [63:0]   update_patch_cycles_axis,
+    input  wire [63:0]   update_commit_cycles_axis,
+    input  wire [63:0]   update_total_cycles_axis,
+    input  wire [31:0]   update_old_version_axis,
+    input  wire [31:0]   update_new_version_axis
 );
     localparam [31:0] FEATURE_WORD = 32'h44524654; // "DRFT"
     localparam [31:0] VERSION_WORD = 32'h00040001; // online-window ABI v4.1
@@ -57,7 +79,10 @@ module driftadapt_control_regs #(
     localparam [31:0] FRAME_BYTES = 32'd60;
 
     reg aw_pending;
+    reg [31:0] awaddr_pending;
     reg w_pending;
+    reg [31:0] wdata_pending;
+    reg [16:0] hist_selector;
 
     (* ASYNC_REG = "TRUE" *) reg generator_active_meta, generator_active_axil;
     (* ASYNC_REG = "TRUE" *) reg generator_finished_meta, generator_finished_axil;
@@ -82,6 +107,22 @@ module driftadapt_control_regs #(
     (* ASYNC_REG = "TRUE" *) reg [63:0] first_input_meta, first_input_axil;
     (* ASYNC_REG = "TRUE" *) reg [63:0] last_output_meta, last_output_axil;
     (* ASYNC_REG = "TRUE" *) reg [63:0] total_cycles_meta, total_cycles_axil;
+    (* ASYNC_REG = "TRUE" *) reg hist_reference_ready_meta, hist_reference_ready_axil;
+    (* ASYNC_REG = "TRUE" *) reg hist_snapshot_valid_meta, hist_snapshot_valid_axil;
+    (* ASYNC_REG = "TRUE" *) reg hist_overflow_meta, hist_overflow_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_window_meta, hist_window_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_samples_meta, hist_samples_axil;
+    (* ASYNC_REG = "TRUE" *) reg update_selective_meta, update_selective_axil;
+    (* ASYNC_REG = "TRUE" *) reg update_clone_meta, update_clone_axil;
+    (* ASYNC_REG = "TRUE" *) reg update_error_meta, update_error_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] update_patched_meta, update_patched_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] update_bytes_meta, update_bytes_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] update_clone_cycles_meta, update_clone_cycles_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] update_patch_cycles_meta, update_patch_cycles_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] update_commit_cycles_meta, update_commit_cycles_axil;
+    (* ASYNC_REG = "TRUE" *) reg [63:0] update_total_cycles_meta, update_total_cycles_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] update_old_version_meta, update_old_version_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] update_new_version_meta, update_new_version_axil;
 
     assign s_axil_awready = axil_aresetn && !aw_pending && !s_axil_bvalid;
     assign s_axil_wready = axil_aresetn && !w_pending && !s_axil_bvalid;
@@ -143,26 +184,72 @@ module driftadapt_control_regs #(
                 12'h0b4: read_register = last_output_axil[63:32];
                 12'h0b8: read_register = total_cycles_axil[31:0];
                 12'h0bc: read_register = total_cycles_axil[63:32];
+                12'h0d8: read_register = {
+                    28'd0, hist_overflow_axil, 1'b0,
+                    hist_reference_ready_axil, hist_snapshot_valid_axil
+                };
+                12'h0dc: read_register = hist_window_axil;
+                12'h0e0: read_register = hist_samples_axil;
+                12'h0e4: read_register = {8'd16, 8'd16, REFERENCE_WINDOWS[15:0]};
+                12'h0e8: read_register = {15'd0, hist_selector};
+                12'h0ec: read_register =
+                    hist_reference_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
+                12'h0f0: read_register = hist_selector[16] ?
+                    hist_snapshot1_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32] :
+                    hist_snapshot0_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
+                12'h0f4: read_register =
+                    {{16{hist_range_min_flat_axis[hist_selector[7:0]*16 + 15]}},
+                     hist_range_min_flat_axis[hist_selector[7:0]*16 +: 16]};
+                12'h0f8: read_register =
+                    {{16{hist_range_max_flat_axis[hist_selector[7:0]*16 + 15]}},
+                     hist_range_max_flat_axis[hist_selector[7:0]*16 +: 16]};
+                12'h0fc: read_register = 32'd4160;
+                12'h118: read_register = {
+                    28'd0, update_error_axil, update_clone_axil,
+                    1'b0, update_selective_axil
+                };
+                12'h11c: read_register = update_patched_axil;
+                12'h120: read_register = update_bytes_axil;
+                12'h124: read_register = update_clone_cycles_axil[31:0];
+                12'h128: read_register = update_clone_cycles_axil[63:32];
+                12'h12c: read_register = update_patch_cycles_axil[31:0];
+                12'h130: read_register = update_patch_cycles_axil[63:32];
+                12'h134: read_register = update_commit_cycles_axil[31:0];
+                12'h138: read_register = update_commit_cycles_axil[63:32];
+                12'h13c: read_register = update_total_cycles_axil[31:0];
+                12'h140: read_register = update_total_cycles_axil[63:32];
+                12'h144: read_register = update_old_version_axil;
+                12'h148: read_register = update_new_version_axil;
                 default: read_register = 32'd0;
             endcase
         end
     endfunction
 
-    // Writes are acknowledged and intentionally ignored on this diagnostic
-    // mirror. Window labels and shadow weights use the private JTAG block.
+    // Writes are acknowledged; only the bounded histogram selector is retained.
+    // Window labels and shadow weights still use the private JTAG block.
     always @(posedge axil_aclk) begin
         if (!axil_aresetn) begin
             aw_pending <= 1'b0;
+            awaddr_pending <= 0;
             w_pending <= 1'b0;
+            wdata_pending <= 0;
+            hist_selector <= 0;
             s_axil_bvalid <= 1'b0;
             s_axil_rvalid <= 1'b0;
             s_axil_rdata <= 32'd0;
         end else begin
-            if (s_axil_awvalid && s_axil_awready)
+            if (s_axil_awvalid && s_axil_awready) begin
                 aw_pending <= 1'b1;
-            if (s_axil_wvalid && s_axil_wready)
+                awaddr_pending <= s_axil_awaddr;
+            end
+            if (s_axil_wvalid && s_axil_wready) begin
                 w_pending <= 1'b1;
+                wdata_pending <= s_axil_wdata;
+            end
             if (aw_pending && w_pending && !s_axil_bvalid) begin
+                if (awaddr_pending[11:0] == 12'h0e8 &&
+                    wdata_pending[7:0] < 16 && wdata_pending[15:8] < 16)
+                    hist_selector <= wdata_pending[16:0];
                 aw_pending <= 1'b0;
                 w_pending <= 1'b0;
                 s_axil_bvalid <= 1'b1;
@@ -204,6 +291,22 @@ module driftadapt_control_regs #(
             first_input_meta <= 0; first_input_axil <= 0;
             last_output_meta <= 0; last_output_axil <= 0;
             total_cycles_meta <= 0; total_cycles_axil <= 0;
+            hist_reference_ready_meta <= 0; hist_reference_ready_axil <= 0;
+            hist_snapshot_valid_meta <= 0; hist_snapshot_valid_axil <= 0;
+            hist_overflow_meta <= 0; hist_overflow_axil <= 0;
+            hist_window_meta <= 0; hist_window_axil <= 0;
+            hist_samples_meta <= 0; hist_samples_axil <= 0;
+            update_selective_meta <= 0; update_selective_axil <= 0;
+            update_clone_meta <= 0; update_clone_axil <= 0;
+            update_error_meta <= 0; update_error_axil <= 0;
+            update_patched_meta <= 0; update_patched_axil <= 0;
+            update_bytes_meta <= 0; update_bytes_axil <= 0;
+            update_clone_cycles_meta <= 0; update_clone_cycles_axil <= 0;
+            update_patch_cycles_meta <= 0; update_patch_cycles_axil <= 0;
+            update_commit_cycles_meta <= 0; update_commit_cycles_axil <= 0;
+            update_total_cycles_meta <= 0; update_total_cycles_axil <= 0;
+            update_old_version_meta <= 0; update_old_version_axil <= 0;
+            update_new_version_meta <= 0; update_new_version_axil <= 0;
         end else begin
             generator_active_meta <= generator_active_axis;
             generator_active_axil <= generator_active_meta;
@@ -239,8 +342,39 @@ module driftadapt_control_regs #(
             last_output_axil <= last_output_meta;
             total_cycles_meta <= total_cycles_axis;
             total_cycles_axil <= total_cycles_meta;
+            hist_reference_ready_meta <= hist_reference_ready_axis;
+            hist_reference_ready_axil <= hist_reference_ready_meta;
+            hist_snapshot_valid_meta <= hist_snapshot_valid_axis;
+            hist_snapshot_valid_axil <= hist_snapshot_valid_meta;
+            hist_overflow_meta <= hist_overflow_error_axis;
+            hist_overflow_axil <= hist_overflow_meta;
+            hist_window_meta <= hist_completed_window_id_axis;
+            hist_window_axil <= hist_window_meta;
+            hist_samples_meta <= hist_completed_window_samples_axis;
+            hist_samples_axil <= hist_samples_meta;
+            update_selective_meta <= update_selective_mode_axis;
+            update_selective_axil <= update_selective_meta;
+            update_clone_meta <= update_clone_complete_axis;
+            update_clone_axil <= update_clone_meta;
+            update_error_meta <= update_verify_error_axis;
+            update_error_axil <= update_error_meta;
+            update_patched_meta <= update_patched_parameters_axis;
+            update_patched_axil <= update_patched_meta;
+            update_bytes_meta <= update_bytes_axis;
+            update_bytes_axil <= update_bytes_meta;
+            update_clone_cycles_meta <= update_clone_cycles_axis;
+            update_clone_cycles_axil <= update_clone_cycles_meta;
+            update_patch_cycles_meta <= update_patch_cycles_axis;
+            update_patch_cycles_axil <= update_patch_cycles_meta;
+            update_commit_cycles_meta <= update_commit_cycles_axis;
+            update_commit_cycles_axil <= update_commit_cycles_meta;
+            update_total_cycles_meta <= update_total_cycles_axis;
+            update_total_cycles_axil <= update_total_cycles_meta;
+            update_old_version_meta <= update_old_version_axis;
+            update_old_version_axil <= update_old_version_meta;
+            update_new_version_meta <= update_new_version_axis;
+            update_new_version_axil <= update_new_version_meta;
         end
     end
 
-    wire unused_write_data = ^{s_axil_awaddr, s_axil_wdata};
 endmodule

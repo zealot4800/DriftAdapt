@@ -13,7 +13,8 @@ module driftadapt_window_manager #(
     parameter integer DATASET_COUNT = 16000,
     parameter integer WINDOW_SIZE = 100,
     parameter integer PARAM_COUNT = 182,
-    parameter integer AXIS_CLOCK_HZ = 250000000
+    parameter integer AXIS_CLOCK_HZ = 250000000,
+    parameter integer REFERENCE_WINDOWS = 10
 ) (
     input  wire          clk,
     input  wire          rst_n,
@@ -34,6 +35,16 @@ module driftadapt_window_manager #(
     input  wire [63:0]   latency_min_cycles_axis,
     input  wire [63:0]   latency_max_cycles_axis,
     input  wire [63:0]   total_cycles_axis,
+    input  wire          hist_reference_ready_axis,
+    input  wire          hist_snapshot_valid_axis,
+    input  wire          hist_overflow_error_axis,
+    input  wire [31:0]   hist_completed_window_id_axis,
+    input  wire [31:0]   hist_completed_window_samples_axis,
+    input  wire [8191:0] hist_reference_flat_axis,
+    input  wire [8191:0] hist_snapshot0_flat_axis,
+    input  wire [8191:0] hist_snapshot1_flat_axis,
+    input  wire [255:0]  hist_range_min_flat_axis,
+    input  wire [255:0]  hist_range_max_flat_axis,
     output wire          online_complete_axis,
     output wire [63:0]   total_captured_axis,
     output wire [63:0]   total_labeled_axis,
@@ -41,12 +52,28 @@ module driftadapt_window_manager #(
     output wire [63:0]   proxy_true_negative_axis,
     output wire [63:0]   proxy_false_positive_axis,
     output wire [63:0]   proxy_false_negative_axis,
+    output wire          update_selective_mode_status_axis,
+    output wire          update_clone_complete_axis,
+    output wire          update_verify_error_axis,
+    output wire [31:0]   update_patched_parameters_axis,
+    output wire [31:0]   update_bytes_axis,
+    output wire [63:0]   update_clone_cycles_axis,
+    output wire [63:0]   update_patch_cycles_axis,
+    output wire [63:0]   update_commit_cycles_axis,
+    output wire [63:0]   update_total_cycles_axis,
+    output wire [31:0]   update_old_version_axis,
+    output wire [31:0]   update_new_version_axis,
 
     output reg           weight_stage_valid_axis,
     output reg  [7:0]    weight_stage_index_axis,
     output reg  [31:0]   weight_stage_data_axis,
+    output reg           weight_clone_request_axis,
+    output reg           selective_update_mode_axis,
     output reg           weight_commit_request_axis,
+    input  wire          weight_clone_ack_axis,
+    input  wire          weight_clone_busy_axis,
     input  wire          weight_commit_ack_axis,
+    input  wire          selective_verify_error_axis,
     input  wire          weights_loaded_axis,
     input  wire          active_weight_bank_axis,
     input  wire [31:0]   model_version_axis,
@@ -139,11 +166,28 @@ module driftadapt_window_manager #(
     reg [PARAM_COUNT-1:0] weight_stage_mask;
     reg [7:0] weight_stage_count;
     reg [31:0] weight_shadow [0:PARAM_COUNT-1];
+    reg update_active;
+    reg clone_complete;
+    reg update_protocol_error;
+    reg last_update_selective;
+    reg [31:0] last_patched_parameters;
+    reg [31:0] last_update_bytes;
+    reg [63:0] clone_cycle_counter;
+    reg [63:0] patch_cycle_counter;
+    reg [63:0] commit_cycle_counter;
+    reg [63:0] total_update_cycle_counter;
+    reg [63:0] last_clone_cycles;
+    reg [63:0] last_patch_cycles;
+    reg [63:0] last_commit_cycles;
+    reg [63:0] last_total_update_cycles;
+    reg [31:0] update_old_version;
+    reg [31:0] update_new_version;
 
     reg aw_pending;
     reg [31:0] awaddr_pending;
     reg w_pending;
     reg [31:0] wdata_pending;
+    reg [16:0] hist_selector;
 
     integer reset_index;
     integer write_word;
@@ -199,6 +243,21 @@ module driftadapt_window_manager #(
     assign proxy_true_negative_axis = {32'd0, last_true_negative};
     assign proxy_false_positive_axis = {32'd0, last_false_positive};
     assign proxy_false_negative_axis = {32'd0, last_false_negative};
+    assign update_selective_mode_status_axis = update_active ?
+        selective_update_mode_axis : last_update_selective;
+    assign update_clone_complete_axis = clone_complete;
+    assign update_verify_error_axis = update_protocol_error |
+        selective_verify_error_axis;
+    assign update_patched_parameters_axis = update_active ?
+        {24'd0, weight_stage_count} : last_patched_parameters;
+    assign update_bytes_axis = update_active ?
+        ({24'd0, weight_stage_count} << 2) : last_update_bytes;
+    assign update_clone_cycles_axis = update_active ? clone_cycle_counter : last_clone_cycles;
+    assign update_patch_cycles_axis = update_active ? patch_cycle_counter : last_patch_cycles;
+    assign update_commit_cycles_axis = update_active ? commit_cycle_counter : last_commit_cycles;
+    assign update_total_cycles_axis = update_active ? total_update_cycle_counter : last_total_update_cycles;
+    assign update_old_version_axis = update_old_version;
+    assign update_new_version_axis = update_new_version;
 
     assign s_axil_awready = rst_n && !aw_pending && !s_axil_bvalid;
     assign s_axil_wready = rst_n && !w_pending && !s_axil_bvalid;
@@ -270,6 +329,45 @@ module driftadapt_window_manager #(
                 32'h000000cc: read_register = total_cycles_axis[63:32];
                 32'h000000d0: read_register = closed_loop_cycles[31:0];
                 32'h000000d4: read_register = closed_loop_cycles[63:32];
+                32'h000000d8: read_register = {
+                    28'd0, hist_overflow_error_axis, 1'b0,
+                    hist_reference_ready_axis, hist_snapshot_valid_axis
+                };
+                32'h000000dc: read_register = hist_completed_window_id_axis;
+                32'h000000e0: read_register = hist_completed_window_samples_axis;
+                32'h000000e4: read_register = {8'd16, 8'd16, REFERENCE_WINDOWS[15:0]};
+                32'h000000e8: read_register = {15'd0, hist_selector};
+                32'h000000ec: read_register =
+                    hist_reference_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
+                32'h000000f0: read_register = hist_selector[16] ?
+                    hist_snapshot1_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32] :
+                    hist_snapshot0_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
+                32'h000000f4: read_register =
+                    {{16{hist_range_min_flat_axis[hist_selector[7:0]*16 + 15]}},
+                     hist_range_min_flat_axis[hist_selector[7:0]*16 +: 16]};
+                32'h000000f8: read_register =
+                    {{16{hist_range_max_flat_axis[hist_selector[7:0]*16 + 15]}},
+                     hist_range_max_flat_axis[hist_selector[7:0]*16 +: 16]};
+                32'h000000fc: read_register = 32'd4160;
+                32'h00000118: read_register = {
+                    25'd0, weight_commit_request_axis, update_active,
+                    update_protocol_error | selective_verify_error_axis,
+                    clone_complete, weight_clone_busy_axis,
+                    weight_clone_request_axis, update_selective_mode_status_axis
+                };
+                32'h0000011c: read_register = update_patched_parameters_axis;
+                32'h00000120: read_register = update_bytes_axis;
+                32'h00000124: read_register = update_clone_cycles_axis[31:0];
+                32'h00000128: read_register = update_clone_cycles_axis[63:32];
+                32'h0000012c: read_register = update_patch_cycles_axis[31:0];
+                32'h00000130: read_register = update_patch_cycles_axis[63:32];
+                32'h00000134: read_register = update_commit_cycles_axis[31:0];
+                32'h00000138: read_register = update_commit_cycles_axis[63:32];
+                32'h0000013c: read_register = update_total_cycles_axis[31:0];
+                32'h00000140: read_register = update_total_cycles_axis[63:32];
+                32'h00000144: read_register = update_old_version_axis;
+                32'h00000148: read_register = update_new_version_axis;
+                32'h0000014c: read_register = model_version_axis;
                 32'h0000010c: read_register = {
                     model_version_axis[15:0], 5'd0, active_weight_bank_axis,
                     weight_commit_request_axis, (&weight_stage_mask),
@@ -389,11 +487,30 @@ module driftadapt_window_manager #(
             weight_stage_valid_axis <= 1'b0;
             weight_stage_index_axis <= 0;
             weight_stage_data_axis <= 0;
+            weight_clone_request_axis <= 1'b0;
+            selective_update_mode_axis <= 1'b0;
             weight_commit_request_axis <= 1'b0;
+            update_active <= 1'b0;
+            clone_complete <= 1'b0;
+            update_protocol_error <= 1'b0;
+            last_update_selective <= 1'b0;
+            last_patched_parameters <= 0;
+            last_update_bytes <= 0;
+            clone_cycle_counter <= 0;
+            patch_cycle_counter <= 0;
+            commit_cycle_counter <= 0;
+            total_update_cycle_counter <= 0;
+            last_clone_cycles <= 0;
+            last_patch_cycles <= 0;
+            last_commit_cycles <= 0;
+            last_total_update_cycles <= 0;
+            update_old_version <= 0;
+            update_new_version <= 0;
             aw_pending <= 1'b0;
             awaddr_pending <= 0;
             w_pending <= 1'b0;
             wdata_pending <= 0;
+            hist_selector <= 0;
             s_axil_bvalid <= 1'b0;
             s_axil_rvalid <= 1'b0;
             s_axil_rdata <= 0;
@@ -401,6 +518,21 @@ module driftadapt_window_manager #(
                 weight_shadow[reset_index] <= 0;
         end else begin
             weight_stage_valid_axis <= 1'b0;
+
+            if (update_active) begin
+                total_update_cycle_counter <= total_update_cycle_counter + 1'b1;
+                if (selective_update_mode_axis && !clone_complete)
+                    clone_cycle_counter <= clone_cycle_counter + 1'b1;
+                else if (!weight_commit_request_axis)
+                    patch_cycle_counter <= patch_cycle_counter + 1'b1;
+                if (weight_commit_request_axis)
+                    commit_cycle_counter <= commit_cycle_counter + 1'b1;
+            end
+
+            if (weight_clone_request_axis && weight_clone_ack_axis) begin
+                weight_clone_request_axis <= 1'b0;
+                clone_complete <= 1'b1;
+            end
 
             // sent_packets_axis changes on the first source-to-DNN transfer.
             // It is observed one edge later, so seed with two cycles to retain
@@ -483,6 +615,17 @@ module driftadapt_window_manager #(
 
             if (weight_commit_request_axis && weight_commit_ack_axis) begin
                 weight_commit_request_axis <= 1'b0;
+                last_update_selective <= selective_update_mode_axis;
+                last_patched_parameters <= {24'd0, weight_stage_count};
+                last_update_bytes <= {22'd0, weight_stage_count, 2'b00};
+                last_clone_cycles <= clone_cycle_counter;
+                last_patch_cycles <= patch_cycle_counter;
+                last_commit_cycles <= commit_cycle_counter + 1'b1;
+                last_total_update_cycles <= total_update_cycle_counter + 1'b1;
+                update_new_version <= model_version_axis;
+                update_active <= 1'b0;
+                clone_complete <= 1'b0;
+                selective_update_mode_axis <= 1'b0;
                 weight_stage_mask <= 0;
                 weight_stage_count <= 0;
             end
@@ -529,10 +672,51 @@ module driftadapt_window_manager #(
                 end else if (awaddr_pending == 32'h00000104 && wdata_pending[0]) begin
                     label_error <= 1'b0;
                 end else if (awaddr_pending == 32'h00000108 && wdata_pending[0]) begin
-                    if (&weight_stage_mask)
+                    if ((selective_update_mode_axis && clone_complete &&
+                         weight_stage_count != 0) ||
+                        (!selective_update_mode_axis && (&weight_stage_mask)))
                         weight_commit_request_axis <= 1'b1;
+                    else
+                        update_protocol_error <= 1'b1;
                 end else if (awaddr_pending == 32'h00000114) begin
                     submit_window_id <= wdata_pending;
+                end else if (awaddr_pending == 32'h00000118) begin
+                    if (wdata_pending[2]) begin
+                        update_protocol_error <= 1'b0;
+                    end else if (!update_active && wdata_pending[0]) begin
+                        update_active <= 1'b1;
+                        selective_update_mode_axis <= 1'b1;
+                        weight_clone_request_axis <= 1'b1;
+                        clone_complete <= 1'b0;
+                        update_protocol_error <= 1'b0;
+                        weight_stage_mask <= 0;
+                        weight_stage_count <= 0;
+                        clone_cycle_counter <= 0;
+                        patch_cycle_counter <= 0;
+                        commit_cycle_counter <= 0;
+                        total_update_cycle_counter <= 0;
+                        update_old_version <= model_version_axis;
+                        update_new_version <= model_version_axis;
+                    end else if (!update_active && wdata_pending[1]) begin
+                        update_active <= 1'b1;
+                        selective_update_mode_axis <= 1'b0;
+                        weight_clone_request_axis <= 1'b0;
+                        clone_complete <= 1'b0;
+                        update_protocol_error <= 1'b0;
+                        weight_stage_mask <= 0;
+                        weight_stage_count <= 0;
+                        clone_cycle_counter <= 0;
+                        patch_cycle_counter <= 0;
+                        commit_cycle_counter <= 0;
+                        total_update_cycle_counter <= 0;
+                        update_old_version <= model_version_axis;
+                        update_new_version <= model_version_axis;
+                    end else begin
+                        update_protocol_error <= 1'b1;
+                    end
+                end else if (awaddr_pending == 32'h000000e8) begin
+                    if (wdata_pending[7:0] < 16 && wdata_pending[15:8] < 16)
+                        hist_selector <= wdata_pending[16:0];
                 end else if (awaddr_pending >= BANK0_LABEL_BASE &&
                              awaddr_pending < BANK0_LABEL_BASE + LABEL_WORDS*4) begin
                     write_word = (awaddr_pending - BANK0_LABEL_BASE) >> 2;
@@ -552,13 +736,17 @@ module driftadapt_window_manager #(
                 end else if (awaddr_pending >= WEIGHT_BASE &&
                              awaddr_pending < WEIGHT_BASE + PARAM_COUNT*4) begin
                     write_parameter = (awaddr_pending - WEIGHT_BASE) >> 2;
-                    weight_shadow[write_parameter] <= wdata_pending;
-                    weight_stage_valid_axis <= 1'b1;
-                    weight_stage_index_axis <= write_parameter[7:0];
-                    weight_stage_data_axis <= wdata_pending;
-                    if (!weight_stage_mask[write_parameter]) begin
-                        weight_stage_mask[write_parameter] <= 1'b1;
-                        weight_stage_count <= weight_stage_count + 1'b1;
+                    if (!selective_update_mode_axis || clone_complete) begin
+                        weight_shadow[write_parameter] <= wdata_pending;
+                        weight_stage_valid_axis <= 1'b1;
+                        weight_stage_index_axis <= write_parameter[7:0];
+                        weight_stage_data_axis <= wdata_pending;
+                        if (!weight_stage_mask[write_parameter]) begin
+                            weight_stage_mask[write_parameter] <= 1'b1;
+                            weight_stage_count <= weight_stage_count + 1'b1;
+                        end
+                    end else begin
+                        update_protocol_error <= 1'b1;
                     end
                 end
                 aw_pending <= 1'b0;

@@ -27,6 +27,7 @@ wait_on_run driftadapt_jtag_axi_synth_1
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_benchmark_metrics.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_control_regs.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_dnn_axis.sv]
+read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_hist_monitor.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_packet_generator.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_window_manager.sv]
 read_verilog -quiet -sv [file join $plugin_root driftadapt_u55c_250mhz.sv]

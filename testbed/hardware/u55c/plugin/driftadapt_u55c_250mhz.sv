@@ -1,7 +1,8 @@
 `timescale 1ns/1ps
 
 // DRIFTADAPT online-learning testbed:
-//   sample source -> fixed-point DNN -> dual labeling-window buffer.
+//   sample source -> fixed-point DNN -> dual labeling-window buffer,
+//                 +-> label-free histogram monitor.
 //
 // Traffic and inference stay entirely in fabric. A local control-plane agent
 // reads completed windows and returns generated labels through the private
@@ -12,6 +13,7 @@ module driftadapt_u55c_250mhz #(
     parameter integer NUM_CMAC_PORT = 2,
     parameter integer SAMPLE_COUNT = 16000,
     parameter integer WINDOW_SIZE = 100,
+    parameter integer REFERENCE_WINDOWS = 10,
     parameter integer STARTUP_CYCLES = 4096,
     parameter integer GAP_CYCLES = 1,
     parameter WEIGHT_MEM_FILE = "driftadapt_weights.mem",
@@ -96,11 +98,46 @@ module driftadapt_u55c_250mhz #(
         .sent_packets_axis(sent_packets)
     );
 
+    wire hist_reference_ready;
+    wire hist_snapshot_valid;
+    wire hist_overflow_error;
+    wire [31:0] hist_completed_window_id;
+    wire [31:0] hist_completed_window_samples;
+    wire [8191:0] hist_reference_flat;
+    wire [8191:0] hist_snapshot0_flat;
+    wire [8191:0] hist_snapshot1_flat;
+    wire [255:0] hist_range_min_flat;
+    wire [255:0] hist_range_max_flat;
+
+    driftadapt_hist_monitor #(
+        .WINDOW_SIZE(WINDOW_SIZE), .SAMPLE_COUNT(SAMPLE_COUNT),
+        .REFERENCE_WINDOWS(REFERENCE_WINDOWS)
+    ) histogram_monitor (
+        .clk(axis_aclk), .rst_n(axis_aresetn),
+        .sample_tdata(generated_tdata),
+        .sample_accept(generated_tvalid && generated_tready),
+        .reference_ready(hist_reference_ready),
+        .snapshot_valid(hist_snapshot_valid),
+        .overflow_error(hist_overflow_error),
+        .completed_window_id(hist_completed_window_id),
+        .completed_window_samples(hist_completed_window_samples),
+        .reference_hist_flat(hist_reference_flat),
+        .snapshot_hist0_flat(hist_snapshot0_flat),
+        .snapshot_hist1_flat(hist_snapshot1_flat),
+        .range_min_flat(hist_range_min_flat),
+        .range_max_flat(hist_range_max_flat)
+    );
+
     wire weight_stage_valid;
     wire [7:0] weight_stage_index;
     wire [31:0] weight_stage_data;
+    wire weight_clone_request;
+    wire selective_update_mode;
     wire weight_commit_request;
+    wire weight_clone_ack;
+    wire weight_clone_busy;
     wire weight_commit_ack;
+    wire selective_verify_error;
     wire weights_loaded;
     wire active_weight_bank;
     wire [31:0] model_version;
@@ -116,8 +153,13 @@ module driftadapt_u55c_250mhz #(
         .weight_stage_valid_axis(weight_stage_valid),
         .weight_stage_index_axis(weight_stage_index),
         .weight_stage_data_axis(weight_stage_data),
+        .weight_clone_request_axis(weight_clone_request),
+        .selective_update_mode_axis(selective_update_mode),
         .weight_commit_request_axis(weight_commit_request),
+        .weight_clone_ack_axis(weight_clone_ack),
+        .weight_clone_busy_axis(weight_clone_busy),
         .weight_commit_ack_axis(weight_commit_ack),
+        .selective_verify_error_axis(selective_verify_error),
         .weights_loaded_axis(weights_loaded),
         .active_weight_bank_axis(active_weight_bank),
         .model_version_axis(model_version),
@@ -204,9 +246,21 @@ module driftadapt_u55c_250mhz #(
     wire [63:0] proxy_tn;
     wire [63:0] proxy_fp;
     wire [63:0] proxy_fn;
+    wire update_selective_mode_status;
+    wire update_clone_complete;
+    wire update_verify_error;
+    wire [31:0] update_patched_parameters;
+    wire [31:0] update_bytes;
+    wire [63:0] update_clone_cycles;
+    wire [63:0] update_patch_cycles;
+    wire [63:0] update_commit_cycles;
+    wire [63:0] update_total_cycles;
+    wire [31:0] update_old_version;
+    wire [31:0] update_new_version;
 
     driftadapt_window_manager #(
-        .DATASET_COUNT(SAMPLE_COUNT), .WINDOW_SIZE(WINDOW_SIZE)
+        .DATASET_COUNT(SAMPLE_COUNT), .WINDOW_SIZE(WINDOW_SIZE),
+        .REFERENCE_WINDOWS(REFERENCE_WINDOWS)
     ) window_manager (
         .clk(axis_aclk), .rst_n(axis_aresetn),
         .s_axis_tdata(classified_tdata),
@@ -223,6 +277,16 @@ module driftadapt_u55c_250mhz #(
         .latency_min_cycles_axis(latency_min_cycles),
         .latency_max_cycles_axis(latency_max_cycles),
         .total_cycles_axis(total_cycles),
+        .hist_reference_ready_axis(hist_reference_ready),
+        .hist_snapshot_valid_axis(hist_snapshot_valid),
+        .hist_overflow_error_axis(hist_overflow_error),
+        .hist_completed_window_id_axis(hist_completed_window_id),
+        .hist_completed_window_samples_axis(hist_completed_window_samples),
+        .hist_reference_flat_axis(hist_reference_flat),
+        .hist_snapshot0_flat_axis(hist_snapshot0_flat),
+        .hist_snapshot1_flat_axis(hist_snapshot1_flat),
+        .hist_range_min_flat_axis(hist_range_min_flat),
+        .hist_range_max_flat_axis(hist_range_max_flat),
         .online_complete_axis(online_complete),
         .total_captured_axis(total_captured),
         .total_labeled_axis(total_labeled),
@@ -230,11 +294,27 @@ module driftadapt_u55c_250mhz #(
         .proxy_true_negative_axis(proxy_tn),
         .proxy_false_positive_axis(proxy_fp),
         .proxy_false_negative_axis(proxy_fn),
+        .update_selective_mode_status_axis(update_selective_mode_status),
+        .update_clone_complete_axis(update_clone_complete),
+        .update_verify_error_axis(update_verify_error),
+        .update_patched_parameters_axis(update_patched_parameters),
+        .update_bytes_axis(update_bytes),
+        .update_clone_cycles_axis(update_clone_cycles),
+        .update_patch_cycles_axis(update_patch_cycles),
+        .update_commit_cycles_axis(update_commit_cycles),
+        .update_total_cycles_axis(update_total_cycles),
+        .update_old_version_axis(update_old_version),
+        .update_new_version_axis(update_new_version),
         .weight_stage_valid_axis(weight_stage_valid),
         .weight_stage_index_axis(weight_stage_index),
         .weight_stage_data_axis(weight_stage_data),
+        .weight_clone_request_axis(weight_clone_request),
+        .selective_update_mode_axis(selective_update_mode),
         .weight_commit_request_axis(weight_commit_request),
+        .weight_clone_ack_axis(weight_clone_ack),
+        .weight_clone_busy_axis(weight_clone_busy),
         .weight_commit_ack_axis(weight_commit_ack),
+        .selective_verify_error_axis(selective_verify_error),
         .weights_loaded_axis(weights_loaded),
         .active_weight_bank_axis(active_weight_bank),
         .model_version_axis(model_version),
@@ -248,10 +328,11 @@ module driftadapt_u55c_250mhz #(
         .s_axil_rresp(jtag_rresp), .s_axil_rready(jtag_rready)
     );
 
-    // A read-only mirror is retained on the OpenNIC user AXI-Lite aperture for
-    // diagnostics. Online window and model mutations use the private JTAG path.
+    // A diagnostic mirror is retained on the OpenNIC user AXI-Lite aperture.
+    // Only its histogram selector is writable; online window and model
+    // mutations continue to use the private JTAG path.
     driftadapt_control_regs #(
-        .DATASET_COUNT(SAMPLE_COUNT)
+        .DATASET_COUNT(SAMPLE_COUNT), .REFERENCE_WINDOWS(REFERENCE_WINDOWS)
     ) shell_status_regs (
         .s_axil_awvalid(s_axil_awvalid), .s_axil_awaddr(s_axil_awaddr),
         .s_axil_awready(s_axil_awready), .s_axil_wvalid(s_axil_wvalid),
@@ -281,7 +362,28 @@ module driftadapt_u55c_250mhz #(
         .latency_max_cycles_axis(latency_max_cycles),
         .first_input_cycle_axis(first_input_cycle),
         .last_output_cycle_axis(last_output_cycle),
-        .total_cycles_axis(total_cycles)
+        .total_cycles_axis(total_cycles),
+        .hist_reference_ready_axis(hist_reference_ready),
+        .hist_snapshot_valid_axis(hist_snapshot_valid),
+        .hist_overflow_error_axis(hist_overflow_error),
+        .hist_completed_window_id_axis(hist_completed_window_id),
+        .hist_completed_window_samples_axis(hist_completed_window_samples),
+        .hist_reference_flat_axis(hist_reference_flat),
+        .hist_snapshot0_flat_axis(hist_snapshot0_flat),
+        .hist_snapshot1_flat_axis(hist_snapshot1_flat),
+        .hist_range_min_flat_axis(hist_range_min_flat),
+        .hist_range_max_flat_axis(hist_range_max_flat),
+        .update_selective_mode_axis(update_selective_mode_status),
+        .update_clone_complete_axis(update_clone_complete),
+        .update_verify_error_axis(update_verify_error),
+        .update_patched_parameters_axis(update_patched_parameters),
+        .update_bytes_axis(update_bytes),
+        .update_clone_cycles_axis(update_clone_cycles),
+        .update_patch_cycles_axis(update_patch_cycles),
+        .update_commit_cycles_axis(update_commit_cycles),
+        .update_total_cycles_axis(update_total_cycles),
+        .update_old_version_axis(update_old_version),
+        .update_new_version_axis(update_new_version)
     );
 
     assign m_axis_adap_tx_250mhz_tvalid = {NUM_CMAC_PORT{1'b0}};

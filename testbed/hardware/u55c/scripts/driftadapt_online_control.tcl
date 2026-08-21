@@ -5,6 +5,7 @@
 #   snapshot <auto|0|1>
 #   submit <bank> <window-id> <comma-separated-label-words> <comma-separated-valid-words>
 #   weights <182-line-hex-memory-file>
+#   selective <index,hex-value patch file>
 
 set hw_server_url [lindex $argv 0]
 set operation [lindex $argv 1]
@@ -40,6 +41,33 @@ proc driftadapt_write_word {hw_axis address value tag} {
     delete_hw_axi_txn $txn
 }
 
+proc driftadapt_read_u64 {hw_axis low_address high_address tag} {
+    set low [driftadapt_read_integer $hw_axis $low_address ${tag}_lo]
+    set high [driftadapt_read_integer $hw_axis $high_address ${tag}_hi]
+    return [expr {wide($low) | (wide($high) << 32)}]
+}
+
+proc driftadapt_emit_update_metrics {hw_axis mode} {
+    set patched [driftadapt_read_integer $hw_axis 0x11c update_patched]
+    set update_bytes [driftadapt_read_integer $hw_axis 0x120 update_bytes]
+    set clone_cycles [driftadapt_read_u64 $hw_axis 0x124 0x128 clone_cycles]
+    set patch_cycles [driftadapt_read_u64 $hw_axis 0x12c 0x130 patch_cycles]
+    set commit_cycles [driftadapt_read_u64 $hw_axis 0x134 0x138 commit_cycles]
+    set total_cycles [driftadapt_read_u64 $hw_axis 0x13c 0x140 update_total]
+    set old_version [driftadapt_read_integer $hw_axis 0x144 old_version]
+    set new_version [driftadapt_read_integer $hw_axis 0x148 new_version]
+    puts "DRIFTADAPT_UPDATE_MODE=$mode"
+    puts "DRIFTADAPT_UPDATE_TOTAL_PARAMETERS=182"
+    puts "DRIFTADAPT_UPDATE_PATCHED_PARAMETERS=$patched"
+    puts "DRIFTADAPT_UPDATE_BYTES=$update_bytes"
+    puts "DRIFTADAPT_UPDATE_CLONE_CYCLES=$clone_cycles"
+    puts "DRIFTADAPT_UPDATE_PATCH_CYCLES=$patch_cycles"
+    puts "DRIFTADAPT_UPDATE_COMMIT_CYCLES=$commit_cycles"
+    puts "DRIFTADAPT_UPDATE_TOTAL_CYCLES=$total_cycles"
+    puts "DRIFTADAPT_UPDATE_OLD_MODEL_VERSION=$old_version"
+    puts "DRIFTADAPT_UPDATE_NEW_MODEL_VERSION=$new_version"
+}
+
 proc driftadapt_emit_status {hw_axis} {
     set registers {
         FEATURE 0x000 STATUS 0x004 VERSION 0x008 DATASET_COUNT 0x00c
@@ -59,11 +87,52 @@ proc driftadapt_emit_status {hw_axis} {
         LATENCY_MAX_LO 0x0b8 LATENCY_MAX_HI 0x0bc
         SENT_LO 0x0c0 SENT_HI 0x0c4 TOTAL_CYCLES_LO 0x0c8 TOTAL_CYCLES_HI 0x0cc
         CLOSED_LOOP_LO 0x0d0 CLOSED_LOOP_HI 0x0d4
-        WEIGHT_STATUS 0x10c
+        HIST_STATUS 0x0d8 HIST_WINDOW_ID 0x0dc HIST_WINDOW_COUNT 0x0e0
+        HIST_CONFIG 0x0e4 HIST_SELECTOR 0x0e8 HIST_STATE_BYTES 0x0fc
+        WEIGHT_STATUS 0x10c UPDATE_STATUS 0x118 UPDATE_PATCHED 0x11c
+        UPDATE_BYTES 0x120 UPDATE_OLD_VERSION 0x144 UPDATE_NEW_VERSION 0x148
     }
     foreach {name address} $registers {
         set value [driftadapt_read_word $hw_axis $address $name]
         puts "DRIFTADAPT_JTAG_${name}=0x${value}"
+    }
+}
+
+proc driftadapt_emit_histogram {hw_axis window_id window_count} {
+    set status [driftadapt_read_integer $hw_axis 0x0d8 hist_status]
+    set latest_window [driftadapt_read_integer $hw_axis 0x0dc hist_window]
+    set latest_sample_count [driftadapt_read_integer $hw_axis 0x0e0 hist_count]
+    set config [driftadapt_read_integer $hw_axis 0x0e4 hist_config]
+    set state_bytes [driftadapt_read_integer $hw_axis 0x0fc hist_state_bytes]
+    set feature_count [expr {($config >> 24) & 0xff}]
+    set bin_count [expr {($config >> 16) & 0xff}]
+    set reference_windows [expr {$config & 0xffff}]
+    if {($status & 1) == 0} { error "histogram monitor has no completed snapshot" }
+    if {$latest_window < $window_id || $latest_window - $window_id > 1} {
+        error "histogram/window snapshot alignment was lost"
+    }
+    puts "DRIFTADAPT_HIST_STATUS=$status"
+    puts "DRIFTADAPT_HIST_COMPLETED_WINDOW_ID=$latest_window"
+    puts "DRIFTADAPT_HIST_WINDOW_ID=$window_id"
+    puts "DRIFTADAPT_HIST_WINDOW_COUNT=$window_count"
+    puts "DRIFTADAPT_HIST_LATEST_WINDOW_COUNT=$latest_sample_count"
+    puts "DRIFTADAPT_HIST_FEATURE_COUNT=$feature_count"
+    puts "DRIFTADAPT_HIST_BIN_COUNT=$bin_count"
+    puts "DRIFTADAPT_HIST_REFERENCE_WINDOWS=$reference_windows"
+    puts "DRIFTADAPT_HIST_STATE_BYTES=$state_bytes"
+    for {set feature_index 0} {$feature_index < $feature_count} {incr feature_index} {
+        set selector [expr {$feature_index | (($window_id & 1) << 16)}]
+        driftadapt_write_word $hw_axis 0x0e8 $selector hist_range_selector
+        set range_min [driftadapt_read_integer $hw_axis 0x0f4 hist_range_min]
+        set range_max [driftadapt_read_integer $hw_axis 0x0f8 hist_range_max]
+        puts "DRIFTADAPT_HIST_RANGE=$feature_index,$range_min,$range_max"
+        for {set bin_index 0} {$bin_index < $bin_count} {incr bin_index} {
+            set selector [expr {$feature_index | ($bin_index << 8) | (($window_id & 1) << 16)}]
+            driftadapt_write_word $hw_axis 0x0e8 $selector hist_selector
+            set reference [driftadapt_read_integer $hw_axis 0x0ec hist_reference]
+            set current [driftadapt_read_integer $hw_axis 0x0f0 hist_current]
+            puts "DRIFTADAPT_HIST_RECORD=$feature_index,$bin_index,$reference,$current"
+        }
     }
 }
 
@@ -173,6 +242,7 @@ if {$operation eq "status"} {
         }
         puts "DRIFTADAPT_WINDOW_RECORD=$sample,[join $fields ,]"
     }
+    driftadapt_emit_histogram $driftadapt_axis $window_id $sample_count
 } elseif {$operation eq "submit"} {
     set bank [lindex $argv 2]
     set window_id [lindex $argv 3]
@@ -232,6 +302,7 @@ if {$operation eq "status"} {
     set contents [split [string trim [read $stream]] "\n"]
     close $stream
     if {[llength $contents] != 182} { error "weight memory must contain exactly 182 words" }
+    driftadapt_write_word $driftadapt_axis 0x118 2 full_update_begin
     for {set index 0} {$index < 182} {incr index} {
         scan [string trim [lindex $contents $index]] %x value
         driftadapt_write_word $driftadapt_axis [expr {0x4000 + $index*4}] $value weight
@@ -249,6 +320,78 @@ if {$operation eq "status"} {
     set version [driftadapt_read_integer $driftadapt_axis 0x078 model_version]
     puts "DRIFTADAPT_WEIGHT_COMMIT=PASS"
     puts "DRIFTADAPT_MODEL_VERSION=$version"
+    driftadapt_emit_update_metrics $driftadapt_axis full
+} elseif {$operation eq "selective"} {
+    set patch_file [lindex $argv 2]
+    if {$patch_file eq "" || ![file isfile $patch_file]} {
+        error "selective mode requires a readable index,value patch file"
+    }
+    set stream [open $patch_file r]
+    set lines [split [string trim [read $stream]] "\n"]
+    close $stream
+    if {[llength $lines] < 1 || [llength $lines] > 182} {
+        error "selective patch count must be in the range 1..182"
+    }
+    array set seen_indices {}
+    set patches {}
+    foreach line $lines {
+        set fields [split [string trim $line] ,]
+        if {[llength $fields] != 2} { error "selective patch lines must be index,hex-value" }
+        set parameter_index [string trim [lindex $fields 0]]
+        set parameter_hex [string trim [lindex $fields 1]]
+        if {![string is integer -strict $parameter_index] ||
+            $parameter_index < 0 || $parameter_index >= 182} {
+            error "selective parameter index is outside 0..181"
+        }
+        if {[info exists seen_indices($parameter_index)]} {
+            error "duplicate selective parameter index $parameter_index"
+        }
+        if {[scan $parameter_hex %x parameter_value] != 1} {
+            error "invalid selective parameter value: $parameter_hex"
+        }
+        set seen_indices($parameter_index) 1
+        lappend patches [list $parameter_index $parameter_value]
+    }
+
+    driftadapt_write_word $driftadapt_axis 0x118 1 selective_clone
+    set deadline [expr {[clock milliseconds] + 5000}]
+    while {1} {
+        set update_status [driftadapt_read_integer $driftadapt_axis 0x118 clone_status]
+        if {($update_status & 0x10) != 0} { error "selective clone protocol failed" }
+        if {($update_status & 0x8) != 0} { break }
+        if {[clock milliseconds] >= $deadline} { error "timed out cloning the active model" }
+        after 10
+    }
+
+    foreach patch $patches {
+        set parameter_index [lindex $patch 0]
+        set parameter_value [lindex $patch 1]
+        driftadapt_write_word $driftadapt_axis \
+            [expr {0x4000 + $parameter_index*4}] $parameter_value selective_patch
+    }
+    set staged [driftadapt_read_integer $driftadapt_axis 0x07c selective_staged]
+    if {$staged != [llength $patches]} {
+        error "FPGA accepted $staged of [llength $patches] selective patches"
+    }
+
+    driftadapt_write_word $driftadapt_axis 0x108 1 selective_commit
+    set deadline [expr {[clock milliseconds] + 5000}]
+    while {1} {
+        set update_status [driftadapt_read_integer $driftadapt_axis 0x118 verify_status]
+        if {($update_status & 0x20) == 0} { break }
+        if {[clock milliseconds] >= $deadline} { error "timed out verifying selective update" }
+        after 10
+    }
+    set update_status [driftadapt_read_integer $driftadapt_axis 0x118 final_update_status]
+    if {($update_status & 0x10) != 0} {
+        error "unchanged shadow parameters differ from the previously active model"
+    }
+    set old_version [driftadapt_read_integer $driftadapt_axis 0x144 selective_old_version]
+    set version [driftadapt_read_integer $driftadapt_axis 0x078 selective_model_version]
+    if {$version != $old_version + 1} { error "selective atomic commit did not advance the model version" }
+    puts "DRIFTADAPT_SELECTIVE_COMMIT=PASS"
+    puts "DRIFTADAPT_MODEL_VERSION=$version"
+    driftadapt_emit_update_metrics $driftadapt_axis selective
 } else {
     error "unknown DRIFTADAPT online-control operation: $operation"
 }

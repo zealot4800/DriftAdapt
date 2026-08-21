@@ -16,8 +16,13 @@ module driftadapt_dnn_axis #(
     input  wire          weight_stage_valid_axis,
     input  wire [7:0]    weight_stage_index_axis,
     input  wire [31:0]   weight_stage_data_axis,
+    input  wire          weight_clone_request_axis,
+    input  wire          selective_update_mode_axis,
     input  wire          weight_commit_request_axis,
+    output reg           weight_clone_ack_axis,
+    output reg           weight_clone_busy_axis,
     output reg           weight_commit_ack_axis,
+    output reg           selective_verify_error_axis,
     output reg           weights_loaded_axis,
     output reg           active_weight_bank_axis,
     output reg  [31:0]   model_version_axis,
@@ -52,6 +57,11 @@ module driftadapt_dnn_axis #(
     reg signed [63:0] scaled_product;
     reg signed [63:0] first_logit;
     reg [511:0] packet_data;
+    reg [7:0] clone_index;
+    reg [7:0] verify_index;
+    reg verify_busy;
+    reg [PARAM_COUNT-1:0] selective_patch_mask;
+    reg verify_mismatch;
     integer index;
 
     initial begin
@@ -114,7 +124,9 @@ module driftadapt_dnn_axis #(
 
     // Do not begin an inference unless the window recorder can eventually
     // accept it. This keeps per-inference latency separate from agent stalls.
-    assign s_axis_tready = state == IDLE && !weight_commit_request_axis &&
+    assign s_axis_tready = state == IDLE && !weight_clone_request_axis &&
+                           !weight_clone_busy_axis && !weight_commit_request_axis &&
+                           !verify_busy &&
                            m_axis_tready;
     assign m_axis_tvalid = state == OUTPUT_PACKET;
     assign m_axis_tdata = packet_data;
@@ -132,7 +144,15 @@ module driftadapt_dnn_axis #(
             scaled_product <= 0;
             first_logit <= 0;
             packet_data <= 0;
+            clone_index <= 0;
+            verify_index <= 0;
+            verify_busy <= 1'b0;
+            selective_patch_mask <= 0;
+            verify_mismatch <= 1'b0;
+            weight_clone_ack_axis <= 1'b0;
+            weight_clone_busy_axis <= 1'b0;
             weight_commit_ack_axis <= 1'b0;
+            selective_verify_error_axis <= 1'b0;
             weights_loaded_axis <= 1'b1;
             active_weight_bank_axis <= 1'b0;
             model_version_axis <= 32'd0;
@@ -142,20 +162,76 @@ module driftadapt_dnn_axis #(
         end else begin
             if (!weight_commit_request_axis)
                 weight_commit_ack_axis <= 1'b0;
+            if (!weight_clone_request_axis)
+                weight_clone_ack_axis <= 1'b0;
 
-            if (weight_stage_valid_axis && weight_stage_index_axis < PARAM_COUNT) begin
+            if (weight_stage_valid_axis && weight_stage_index_axis < PARAM_COUNT &&
+                !weight_clone_busy_axis && !verify_busy) begin
                 if (active_weight_bank_axis)
                     weight_bank0[weight_stage_index_axis] <= weight_stage_data_axis;
                 else
                     weight_bank1[weight_stage_index_axis] <= weight_stage_data_axis;
+                if (selective_update_mode_axis)
+                    selective_patch_mask[weight_stage_index_axis] <= 1'b1;
+            end
+
+            if (state == IDLE && weight_clone_request_axis &&
+                !weight_clone_ack_axis && !weight_clone_busy_axis && !verify_busy) begin
+                weight_clone_busy_axis <= 1'b1;
+                clone_index <= 0;
+                selective_patch_mask <= 0;
+                selective_verify_error_axis <= 1'b0;
+            end else if (weight_clone_busy_axis) begin
+                if (active_weight_bank_axis)
+                    weight_bank0[clone_index] <= weight_bank1[clone_index];
+                else
+                    weight_bank1[clone_index] <= weight_bank0[clone_index];
+                if (clone_index == PARAM_COUNT - 1) begin
+                    weight_clone_busy_axis <= 1'b0;
+                    weight_clone_ack_axis <= 1'b1;
+                end else begin
+                    clone_index <= clone_index + 1'b1;
+                end
             end
 
             if (state == IDLE && weight_commit_request_axis &&
-                !weight_commit_ack_axis) begin
-                active_weight_bank_axis <= ~active_weight_bank_axis;
-                model_version_axis <= model_version_axis + 1'b1;
-                weight_commit_ack_axis <= 1'b1;
-                weights_loaded_axis <= 1'b1;
+                !weight_commit_ack_axis && !weight_clone_busy_axis && !verify_busy) begin
+                if (selective_update_mode_axis) begin
+                    verify_busy <= 1'b1;
+                    verify_index <= 0;
+                    verify_mismatch <= 1'b0;
+                    selective_verify_error_axis <= 1'b0;
+                end else begin
+                    selective_verify_error_axis <= 1'b0;
+                    active_weight_bank_axis <= ~active_weight_bank_axis;
+                    model_version_axis <= model_version_axis + 1'b1;
+                    weight_commit_ack_axis <= 1'b1;
+                    weights_loaded_axis <= 1'b1;
+                end
+            end else if (verify_busy) begin
+                if (!selective_patch_mask[verify_index] &&
+                    (active_weight_bank_axis ?
+                     weight_bank0[verify_index] != weight_bank1[verify_index] :
+                     weight_bank1[verify_index] != weight_bank0[verify_index]))
+                    verify_mismatch <= 1'b1;
+
+                if (verify_index == PARAM_COUNT - 1) begin
+                    verify_busy <= 1'b0;
+                    weight_commit_ack_axis <= 1'b1;
+                    if (verify_mismatch ||
+                        (!selective_patch_mask[verify_index] &&
+                         (active_weight_bank_axis ?
+                          weight_bank0[verify_index] != weight_bank1[verify_index] :
+                          weight_bank1[verify_index] != weight_bank0[verify_index]))) begin
+                        selective_verify_error_axis <= 1'b1;
+                    end else begin
+                        active_weight_bank_axis <= ~active_weight_bank_axis;
+                        model_version_axis <= model_version_axis + 1'b1;
+                        weights_loaded_axis <= 1'b1;
+                    end
+                end else begin
+                    verify_index <= verify_index + 1'b1;
+                end
             end
 
             case (state)
