@@ -82,6 +82,18 @@ def fixed_parameter_words(model: torch.nn.Module) -> list[int]:
     return [int(value) & 0xFFFFFFFF for value in scaled]
 
 
+def load_embedded_parameter_words(path: Path) -> list[int]:
+    lines = path.read_text(encoding="ascii").splitlines()
+    if len(lines) != PARAMETER_COUNT:
+        raise RuntimeError(
+            f"embedded hardware model must contain {PARAMETER_COUNT} parameters"
+        )
+    try:
+        return [int(line.strip(), 16) & 0xFFFFFFFF for line in lines]
+    except ValueError as error:
+        raise RuntimeError(f"embedded hardware model is malformed: {path}") from error
+
+
 class JtagTransport:
     def __init__(self, *, vivado: Path, hw_server: str, script: Path) -> None:
         self.vivado = vivado
@@ -120,7 +132,10 @@ class JtagTransport:
             if values.get("ONLINE_COMPLETE") == "1":
                 return {"complete": True}
             return None
-        required = {"WINDOW_BANK", "WINDOW_ID", "WINDOW_COUNT", "WINDOW_FIRST_SAMPLE"}
+        required = {
+            "WINDOW_BANK", "WINDOW_ID", "WINDOW_COUNT", "WINDOW_FIRST_SAMPLE",
+            "WINDOW_MODEL_VERSION", "ACTIVE_MODEL_VERSION",
+        }
         missing = required - values.keys()
         if missing:
             raise RuntimeError(f"window snapshot omitted: {', '.join(sorted(missing))}")
@@ -200,6 +215,8 @@ class JtagTransport:
             "window_id": parse_integer(values["WINDOW_ID"]),
             "count": count,
             "first_sample": parse_integer(values["WINDOW_FIRST_SAMPLE"]),
+            "inference_model_version": parse_integer(values["WINDOW_MODEL_VERSION"]),
+            "active_model_version": parse_integer(values["ACTIVE_MODEL_VERSION"]),
             "records": records,
             "histogram": histogram,
         }
@@ -390,6 +407,12 @@ def main() -> None:
         student, resolve_config_path(model_config["checkpoint"], config_base), device,
     )
     student.eval()
+    embedded_weight_path = repo_root / "testbed/hardware/u55c/assets/driftadapt_weights.mem"
+    if fixed_parameter_words(student) != load_embedded_parameter_words(embedded_weight_path):
+        raise RuntimeError(
+            "configured student checkpoint does not match the 182-parameter model "
+            "embedded in the U55C image; regenerate FPGA assets and rebuild"
+        )
     optimizer = None
 
     trigger_config = config["trigger"]
@@ -436,6 +459,11 @@ def main() -> None:
             continue
         if snapshot.get("complete"):
             break
+        if snapshot["active_model_version"] != active_model_version:
+            raise RuntimeError(
+                "host student and active FPGA model versions diverged: "
+                f"host={active_model_version}, fpga={snapshot['active_model_version']}"
+            )
         if snapshot["count"] > configured_window_size:
             raise RuntimeError(
                 f"FPGA window {snapshot['count']} exceeds configured size {configured_window_size}"
@@ -645,6 +673,7 @@ def main() -> None:
             "candidate_proxy_macro_f1": candidate_proxy,
             "deployed": deployed,
             "model_version": model_version,
+            "inference_model_version": snapshot["inference_model_version"],
             "feature_drift_reference_ready": reference_ready,
             "feature_drift_scores": named_feature_scores,
             "drifted_feature_indices": drifted_feature_indices,

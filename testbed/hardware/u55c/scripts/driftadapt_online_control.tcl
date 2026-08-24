@@ -75,6 +75,8 @@ proc driftadapt_emit_status {hw_axis} {
         READY_MASK 0x020 BANK0_WINDOW_ID 0x024 BANK0_COUNT 0x028
         BANK0_FIRST_SAMPLE 0x02c BANK1_WINDOW_ID 0x030 BANK1_COUNT 0x034
         BANK1_FIRST_SAMPLE 0x038 CAPTURED_LO 0x03c CAPTURED_HI 0x040
+        BANK0_MODEL_VERSION 0x044 BANK1_MODEL_VERSION 0x048
+        LAST_MODEL_VERSION 0x04c
         LAST_WINDOW_ID 0x050 LAST_WINDOW_COUNT 0x054 LAST_TP 0x058
         LAST_TN 0x05c LAST_FP 0x060 LAST_FN 0x064 LAST_MATCHES 0x068
         WINDOWS_LABELED 0x06c LABELED_LO 0x070 LABELED_HI 0x074
@@ -218,22 +220,30 @@ if {$operation eq "status"} {
         set id_address 0x024
         set count_address 0x028
         set first_address 0x02c
+        set model_version_address 0x044
         set record_base 0x10000
     } else {
         set id_address 0x030
         set count_address 0x034
         set first_address 0x038
+        set model_version_address 0x048
         set record_base 0x20000
     }
     set window_id [driftadapt_read_integer $driftadapt_axis $id_address window_id]
     set sample_count [driftadapt_read_integer $driftadapt_axis $count_address count]
     set first_sample [driftadapt_read_integer $driftadapt_axis $first_address first]
+    set window_model_version [driftadapt_read_integer \
+        $driftadapt_axis $model_version_address window_model_version]
+    set active_model_version [driftadapt_read_integer \
+        $driftadapt_axis 0x078 active_model_version]
     puts "DRIFTADAPT_WINDOW_READY=1"
     puts "DRIFTADAPT_ONLINE_COMPLETE=0"
     puts "DRIFTADAPT_WINDOW_BANK=$bank"
     puts "DRIFTADAPT_WINDOW_ID=$window_id"
     puts "DRIFTADAPT_WINDOW_COUNT=$sample_count"
     puts "DRIFTADAPT_WINDOW_FIRST_SAMPLE=$first_sample"
+    puts "DRIFTADAPT_WINDOW_MODEL_VERSION=$window_model_version"
+    puts "DRIFTADAPT_ACTIVE_MODEL_VERSION=$active_model_version"
     for {set sample 0} {$sample < $sample_count} {incr sample} {
         set fields {}
         for {set word 0} {$word < 11} {incr word} {

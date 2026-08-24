@@ -58,10 +58,18 @@ module driftadapt_dnn_axis #(
     reg signed [63:0] first_logit;
     reg [511:0] packet_data;
     reg [7:0] clone_index;
+    reg clone_write_phase;
+    reg signed [31:0] clone_data;
     reg [7:0] verify_index;
     reg verify_busy;
+    reg verify_compare_phase;
+    reg signed [31:0] verify_active_data;
+    reg signed [31:0] verify_shadow_data;
     reg [PARAM_COUNT-1:0] selective_patch_mask;
     reg verify_mismatch;
+    reg stage_write_pending;
+    reg [7:0] stage_write_index;
+    reg [31:0] stage_write_data;
     integer index;
 
     initial begin
@@ -145,10 +153,18 @@ module driftadapt_dnn_axis #(
             first_logit <= 0;
             packet_data <= 0;
             clone_index <= 0;
+            clone_write_phase <= 1'b0;
+            clone_data <= 0;
             verify_index <= 0;
             verify_busy <= 1'b0;
+            verify_compare_phase <= 1'b0;
+            verify_active_data <= 0;
+            verify_shadow_data <= 0;
             selective_patch_mask <= 0;
             verify_mismatch <= 1'b0;
+            stage_write_pending <= 1'b0;
+            stage_write_index <= 0;
+            stage_write_data <= 0;
             weight_clone_ack_axis <= 1'b0;
             weight_clone_busy_axis <= 1'b0;
             weight_commit_ack_axis <= 1'b0;
@@ -165,40 +181,62 @@ module driftadapt_dnn_axis #(
             if (!weight_clone_request_axis)
                 weight_clone_ack_axis <= 1'b0;
 
-            if (weight_stage_valid_axis && weight_stage_index_axis < PARAM_COUNT &&
-                !weight_clone_busy_axis && !verify_busy) begin
+            // Register host writes before decoding the distributed weight
+            // banks. This keeps AXI address/control logic off the bank enables.
+            if (stage_write_pending && !weight_clone_busy_axis && !verify_busy) begin
                 if (active_weight_bank_axis)
-                    weight_bank0[weight_stage_index_axis] <= weight_stage_data_axis;
+                    weight_bank0[stage_write_index] <= stage_write_data;
                 else
-                    weight_bank1[weight_stage_index_axis] <= weight_stage_data_axis;
+                    weight_bank1[stage_write_index] <= stage_write_data;
                 if (selective_update_mode_axis)
-                    selective_patch_mask[weight_stage_index_axis] <= 1'b1;
+                    selective_patch_mask[stage_write_index] <= 1'b1;
+                stage_write_pending <= 1'b0;
+            end else if (weight_stage_valid_axis &&
+                         weight_stage_index_axis < PARAM_COUNT &&
+                         !weight_clone_busy_axis && !verify_busy) begin
+                stage_write_pending <= 1'b1;
+                stage_write_index <= weight_stage_index_axis;
+                stage_write_data <= weight_stage_data_axis;
             end
 
             if (state == IDLE && weight_clone_request_axis &&
-                !weight_clone_ack_axis && !weight_clone_busy_axis && !verify_busy) begin
+                !weight_clone_ack_axis && !weight_clone_busy_axis && !verify_busy &&
+                !stage_write_pending && !weight_stage_valid_axis) begin
                 weight_clone_busy_axis <= 1'b1;
                 clone_index <= 0;
+                clone_write_phase <= 1'b0;
                 selective_patch_mask <= 0;
                 selective_verify_error_axis <= 1'b0;
             end else if (weight_clone_busy_axis) begin
-                if (active_weight_bank_axis)
-                    weight_bank0[clone_index] <= weight_bank1[clone_index];
-                else
-                    weight_bank1[clone_index] <= weight_bank0[clone_index];
-                if (clone_index == PARAM_COUNT - 1) begin
-                    weight_clone_busy_axis <= 1'b0;
-                    weight_clone_ack_axis <= 1'b1;
+                // Split the clone into registered read and write phases so
+                // no dynamic bank-to-bank path spans a single 250 MHz cycle.
+                if (!clone_write_phase) begin
+                    clone_data <= active_weight_bank_axis ?
+                                  weight_bank1[clone_index] :
+                                  weight_bank0[clone_index];
+                    clone_write_phase <= 1'b1;
                 end else begin
-                    clone_index <= clone_index + 1'b1;
+                    if (active_weight_bank_axis)
+                        weight_bank0[clone_index] <= clone_data;
+                    else
+                        weight_bank1[clone_index] <= clone_data;
+                    clone_write_phase <= 1'b0;
+                    if (clone_index == PARAM_COUNT - 1) begin
+                        weight_clone_busy_axis <= 1'b0;
+                        weight_clone_ack_axis <= 1'b1;
+                    end else begin
+                        clone_index <= clone_index + 1'b1;
+                    end
                 end
             end
 
             if (state == IDLE && weight_commit_request_axis &&
-                !weight_commit_ack_axis && !weight_clone_busy_axis && !verify_busy) begin
+                !weight_commit_ack_axis && !weight_clone_busy_axis && !verify_busy &&
+                !stage_write_pending && !weight_stage_valid_axis) begin
                 if (selective_update_mode_axis) begin
                     verify_busy <= 1'b1;
                     verify_index <= 0;
+                    verify_compare_phase <= 1'b0;
                     verify_mismatch <= 1'b0;
                     selective_verify_error_axis <= 1'b0;
                 end else begin
@@ -209,28 +247,37 @@ module driftadapt_dnn_axis #(
                     weights_loaded_axis <= 1'b1;
                 end
             end else if (verify_busy) begin
-                if (!selective_patch_mask[verify_index] &&
-                    (active_weight_bank_axis ?
-                     weight_bank0[verify_index] != weight_bank1[verify_index] :
-                     weight_bank1[verify_index] != weight_bank0[verify_index]))
-                    verify_mismatch <= 1'b1;
-
-                if (verify_index == PARAM_COUNT - 1) begin
-                    verify_busy <= 1'b0;
-                    weight_commit_ack_axis <= 1'b1;
-                    if (verify_mismatch ||
-                        (!selective_patch_mask[verify_index] &&
-                         (active_weight_bank_axis ?
-                          weight_bank0[verify_index] != weight_bank1[verify_index] :
-                          weight_bank1[verify_index] != weight_bank0[verify_index]))) begin
-                        selective_verify_error_axis <= 1'b1;
-                    end else begin
-                        active_weight_bank_axis <= ~active_weight_bank_axis;
-                        model_version_axis <= model_version_axis + 1'b1;
-                        weights_loaded_axis <= 1'b1;
-                    end
+                // As with clone, register both bank reads before comparing.
+                // Patched words are ignored; every unpatched word must match.
+                if (!verify_compare_phase) begin
+                    verify_active_data <= active_weight_bank_axis ?
+                                          weight_bank1[verify_index] :
+                                          weight_bank0[verify_index];
+                    verify_shadow_data <= active_weight_bank_axis ?
+                                          weight_bank0[verify_index] :
+                                          weight_bank1[verify_index];
+                    verify_compare_phase <= 1'b1;
                 end else begin
-                    verify_index <= verify_index + 1'b1;
+                    if (!selective_patch_mask[verify_index] &&
+                        verify_active_data != verify_shadow_data)
+                        verify_mismatch <= 1'b1;
+
+                    verify_compare_phase <= 1'b0;
+                    if (verify_index == PARAM_COUNT - 1) begin
+                        verify_busy <= 1'b0;
+                        weight_commit_ack_axis <= 1'b1;
+                        if (verify_mismatch ||
+                            (!selective_patch_mask[verify_index] &&
+                             verify_active_data != verify_shadow_data)) begin
+                            selective_verify_error_axis <= 1'b1;
+                        end else begin
+                            active_weight_bank_axis <= ~active_weight_bank_axis;
+                            model_version_axis <= model_version_axis + 1'b1;
+                            weights_loaded_axis <= 1'b1;
+                        end
+                    end else begin
+                        verify_index <= verify_index + 1'b1;
+                    end
                 end
             end
 

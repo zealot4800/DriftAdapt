@@ -40,11 +40,11 @@ module driftadapt_window_manager #(
     input  wire          hist_overflow_error_axis,
     input  wire [31:0]   hist_completed_window_id_axis,
     input  wire [31:0]   hist_completed_window_samples_axis,
-    input  wire [8191:0] hist_reference_flat_axis,
-    input  wire [8191:0] hist_snapshot0_flat_axis,
-    input  wire [8191:0] hist_snapshot1_flat_axis,
-    input  wire [255:0]  hist_range_min_flat_axis,
-    input  wire [255:0]  hist_range_max_flat_axis,
+    output wire [16:0]   hist_read_selector_axis,
+    input  wire [31:0]   hist_reference_count_axis,
+    input  wire [31:0]   hist_snapshot_count_axis,
+    input  wire [31:0]   hist_range_min_axis,
+    input  wire [31:0]   hist_range_max_axis,
     output wire          online_complete_axis,
     output wire [63:0]   total_captured_axis,
     output wire [63:0]   total_labeled_axis,
@@ -136,6 +136,8 @@ module driftadapt_window_manager #(
     reg [31:0] bank1_window_id;
     reg [31:0] bank0_first_sample;
     reg [31:0] bank1_first_sample;
+    reg [31:0] bank0_model_version;
+    reg [31:0] bank1_model_version;
     reg [31:0] next_window_id;
     reg [31:0] submit_window_id;
     reg [63:0] total_captured;
@@ -160,6 +162,7 @@ module driftadapt_window_manager #(
     reg [31:0] last_false_positive;
     reg [31:0] last_false_negative;
     reg [31:0] last_matches;
+    reg [31:0] last_model_version;
     reg [31:0] windows_labeled;
     reg [63:0] total_labeled;
 
@@ -187,6 +190,11 @@ module driftadapt_window_manager #(
     reg [31:0] awaddr_pending;
     reg w_pending;
     reg [31:0] wdata_pending;
+    reg weight_write_pending;
+    reg [7:0] weight_write_index;
+    reg [31:0] weight_write_data;
+    reg read_pending;
+    reg [31:0] read_address;
     reg [16:0] hist_selector;
 
     integer reset_index;
@@ -224,6 +232,7 @@ module driftadapt_window_manager #(
 
     wire capture_bank_ready = capture_bank ? bank1_ready : bank0_ready;
     assign s_axis_tready = !capture_bank_ready;
+    assign hist_read_selector_axis = hist_selector;
 
     wire score_prediction = score_bank ? prediction_bits1[score_index] :
                                          prediction_bits0[score_index];
@@ -262,7 +271,7 @@ module driftadapt_window_manager #(
     assign s_axil_awready = rst_n && !aw_pending && !s_axil_bvalid;
     assign s_axil_wready = rst_n && !w_pending && !s_axil_bvalid;
     assign s_axil_bresp = 2'b00;
-    assign s_axil_arready = rst_n && !s_axil_rvalid;
+    assign s_axil_arready = rst_n && !read_pending && !s_axil_rvalid;
     assign s_axil_rresp = 2'b00;
 
     function automatic [31:0] read_register(input [31:0] address);
@@ -295,6 +304,9 @@ module driftadapt_window_manager #(
                 32'h00000038: read_register = bank1_first_sample;
                 32'h0000003c: read_register = total_captured[31:0];
                 32'h00000040: read_register = total_captured[63:32];
+                32'h00000044: read_register = bank0_model_version;
+                32'h00000048: read_register = bank1_model_version;
+                32'h0000004c: read_register = last_model_version;
                 32'h00000050: read_register = last_window_id;
                 32'h00000054: read_register = last_window_count;
                 32'h00000058: read_register = last_true_positive;
@@ -337,17 +349,10 @@ module driftadapt_window_manager #(
                 32'h000000e0: read_register = hist_completed_window_samples_axis;
                 32'h000000e4: read_register = {8'd16, 8'd16, REFERENCE_WINDOWS[15:0]};
                 32'h000000e8: read_register = {15'd0, hist_selector};
-                32'h000000ec: read_register =
-                    hist_reference_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
-                32'h000000f0: read_register = hist_selector[16] ?
-                    hist_snapshot1_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32] :
-                    hist_snapshot0_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
-                32'h000000f4: read_register =
-                    {{16{hist_range_min_flat_axis[hist_selector[7:0]*16 + 15]}},
-                     hist_range_min_flat_axis[hist_selector[7:0]*16 +: 16]};
-                32'h000000f8: read_register =
-                    {{16{hist_range_max_flat_axis[hist_selector[7:0]*16 + 15]}},
-                     hist_range_max_flat_axis[hist_selector[7:0]*16 +: 16]};
+                32'h000000ec: read_register = hist_reference_count_axis;
+                32'h000000f0: read_register = hist_snapshot_count_axis;
+                32'h000000f4: read_register = hist_range_min_axis;
+                32'h000000f8: read_register = hist_range_max_axis;
                 32'h000000fc: read_register = 32'd4160;
                 32'h00000118: read_register = {
                     25'd0, weight_commit_request_axis, update_active,
@@ -452,6 +457,8 @@ module driftadapt_window_manager #(
             bank1_window_id <= 0;
             bank0_first_sample <= 0;
             bank1_first_sample <= 0;
+            bank0_model_version <= 0;
+            bank1_model_version <= 0;
             next_window_id <= 0;
             submit_window_id <= 0;
             total_captured <= 0;
@@ -480,6 +487,7 @@ module driftadapt_window_manager #(
             last_false_positive <= 0;
             last_false_negative <= 0;
             last_matches <= 0;
+            last_model_version <= 0;
             windows_labeled <= 0;
             total_labeled <= 0;
             weight_stage_mask <= 0;
@@ -510,6 +518,11 @@ module driftadapt_window_manager #(
             awaddr_pending <= 0;
             w_pending <= 1'b0;
             wdata_pending <= 0;
+            weight_write_pending <= 1'b0;
+            weight_write_index <= 0;
+            weight_write_data <= 0;
+            read_pending <= 1'b0;
+            read_address <= 0;
             hist_selector <= 0;
             s_axil_bvalid <= 1'b0;
             s_axil_rvalid <= 1'b0;
@@ -518,6 +531,21 @@ module driftadapt_window_manager #(
                 weight_shadow[reset_index] <= 0;
         end else begin
             weight_stage_valid_axis <= 1'b0;
+
+            // Complete decoded weight writes from a compact command register.
+            // The AXI address comparator therefore does not directly drive all
+            // 182 shadow words or the downstream DNN staging enables.
+            if (weight_write_pending) begin
+                weight_shadow[weight_write_index] <= weight_write_data;
+                weight_stage_valid_axis <= 1'b1;
+                weight_stage_index_axis <= weight_write_index;
+                weight_stage_data_axis <= weight_write_data;
+                if (!weight_stage_mask[weight_write_index]) begin
+                    weight_stage_mask[weight_write_index] <= 1'b1;
+                    weight_stage_count <= weight_stage_count + 1'b1;
+                end
+                weight_write_pending <= 1'b0;
+            end
 
             if (update_active) begin
                 total_update_cycle_counter <= total_update_cycle_counter + 1'b1;
@@ -552,6 +580,7 @@ module driftadapt_window_manager #(
                     if (capture_count == 0) begin
                         bank0_window_id <= next_window_id;
                         bank0_first_sample <= total_captured[31:0];
+                        bank0_model_version <= model_version_axis;
                     end
                 end else begin
                     feature_mem1[capture_count] <= packet_features_q8(s_axis_tdata);
@@ -560,6 +589,7 @@ module driftadapt_window_manager #(
                     if (capture_count == 0) begin
                         bank1_window_id <= next_window_id;
                         bank1_first_sample <= total_captured[31:0];
+                        bank1_model_version <= model_version_axis;
                     end
                 end
                 total_captured <= total_captured + 1'b1;
@@ -596,6 +626,8 @@ module driftadapt_window_manager #(
                     last_false_positive <= score_fp + current_fp;
                     last_false_negative <= score_fn + current_fn;
                     last_matches <= score_matches + (score_prediction == score_label);
+                    last_model_version <= score_bank ?
+                        bank1_model_version : bank0_model_version;
                     windows_labeled <= windows_labeled + 1'b1;
                     total_labeled <= total_labeled + score_count;
                     scoring <= 1'b0;
@@ -736,15 +768,11 @@ module driftadapt_window_manager #(
                 end else if (awaddr_pending >= WEIGHT_BASE &&
                              awaddr_pending < WEIGHT_BASE + PARAM_COUNT*4) begin
                     write_parameter = (awaddr_pending - WEIGHT_BASE) >> 2;
-                    if (!selective_update_mode_axis || clone_complete) begin
-                        weight_shadow[write_parameter] <= wdata_pending;
-                        weight_stage_valid_axis <= 1'b1;
-                        weight_stage_index_axis <= write_parameter[7:0];
-                        weight_stage_data_axis <= wdata_pending;
-                        if (!weight_stage_mask[write_parameter]) begin
-                            weight_stage_mask[write_parameter] <= 1'b1;
-                            weight_stage_count <= weight_stage_count + 1'b1;
-                        end
+                    if ((!selective_update_mode_axis || clone_complete) &&
+                        !weight_write_pending) begin
+                        weight_write_pending <= 1'b1;
+                        weight_write_index <= write_parameter[7:0];
+                        weight_write_data <= wdata_pending;
                     end else begin
                         update_protocol_error <= 1'b1;
                     end
@@ -757,8 +785,13 @@ module driftadapt_window_manager #(
             end
 
             if (s_axil_arvalid && s_axil_arready) begin
-                s_axil_rdata <= read_register(s_axil_araddr);
+                read_address <= s_axil_araddr;
+                read_pending <= 1'b1;
+            end
+            if (read_pending && !s_axil_rvalid) begin
+                s_axil_rdata <= read_register(read_address);
                 s_axil_rvalid <= 1'b1;
+                read_pending <= 1'b0;
             end else if (s_axil_rvalid && s_axil_rready) begin
                 s_axil_rvalid <= 1'b0;
             end

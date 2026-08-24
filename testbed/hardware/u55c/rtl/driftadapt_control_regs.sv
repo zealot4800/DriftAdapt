@@ -55,11 +55,11 @@ module driftadapt_control_regs #(
     input  wire          hist_overflow_error_axis,
     input  wire [31:0]   hist_completed_window_id_axis,
     input  wire [31:0]   hist_completed_window_samples_axis,
-    input  wire [8191:0] hist_reference_flat_axis,
-    input  wire [8191:0] hist_snapshot0_flat_axis,
-    input  wire [8191:0] hist_snapshot1_flat_axis,
-    input  wire [255:0]  hist_range_min_flat_axis,
-    input  wire [255:0]  hist_range_max_flat_axis,
+    output wire [16:0]   hist_read_selector_axis,
+    input  wire [31:0]   hist_reference_count_axis,
+    input  wire [31:0]   hist_snapshot_count_axis,
+    input  wire [31:0]   hist_range_min_axis,
+    input  wire [31:0]   hist_range_max_axis,
     input  wire          update_selective_mode_axis,
     input  wire          update_clone_complete_axis,
     input  wire          update_verify_error_axis,
@@ -112,6 +112,10 @@ module driftadapt_control_regs #(
     (* ASYNC_REG = "TRUE" *) reg hist_overflow_meta, hist_overflow_axil;
     (* ASYNC_REG = "TRUE" *) reg [31:0] hist_window_meta, hist_window_axil;
     (* ASYNC_REG = "TRUE" *) reg [31:0] hist_samples_meta, hist_samples_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_reference_count_meta, hist_reference_count_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_snapshot_count_meta, hist_snapshot_count_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_range_min_meta, hist_range_min_axil;
+    (* ASYNC_REG = "TRUE" *) reg [31:0] hist_range_max_meta, hist_range_max_axil;
     (* ASYNC_REG = "TRUE" *) reg update_selective_meta, update_selective_axil;
     (* ASYNC_REG = "TRUE" *) reg update_clone_meta, update_clone_axil;
     (* ASYNC_REG = "TRUE" *) reg update_error_meta, update_error_axil;
@@ -129,6 +133,7 @@ module driftadapt_control_regs #(
     assign s_axil_bresp = 2'b00;
     assign s_axil_arready = axil_aresetn && !s_axil_rvalid;
     assign s_axil_rresp = 2'b00;
+    assign hist_read_selector_axis = hist_selector;
 
     function automatic [31:0] read_register(input [11:0] address);
         begin
@@ -192,17 +197,10 @@ module driftadapt_control_regs #(
                 12'h0e0: read_register = hist_samples_axil;
                 12'h0e4: read_register = {8'd16, 8'd16, REFERENCE_WINDOWS[15:0]};
                 12'h0e8: read_register = {15'd0, hist_selector};
-                12'h0ec: read_register =
-                    hist_reference_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
-                12'h0f0: read_register = hist_selector[16] ?
-                    hist_snapshot1_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32] :
-                    hist_snapshot0_flat_axis[((hist_selector[7:0] * 16) + hist_selector[15:8])*32 +: 32];
-                12'h0f4: read_register =
-                    {{16{hist_range_min_flat_axis[hist_selector[7:0]*16 + 15]}},
-                     hist_range_min_flat_axis[hist_selector[7:0]*16 +: 16]};
-                12'h0f8: read_register =
-                    {{16{hist_range_max_flat_axis[hist_selector[7:0]*16 + 15]}},
-                     hist_range_max_flat_axis[hist_selector[7:0]*16 +: 16]};
+                12'h0ec: read_register = hist_reference_count_axil;
+                12'h0f0: read_register = hist_snapshot_count_axil;
+                12'h0f4: read_register = hist_range_min_axil;
+                12'h0f8: read_register = hist_range_max_axil;
                 12'h0fc: read_register = 32'd4160;
                 12'h118: read_register = {
                     28'd0, update_error_axil, update_clone_axil,
@@ -296,6 +294,10 @@ module driftadapt_control_regs #(
             hist_overflow_meta <= 0; hist_overflow_axil <= 0;
             hist_window_meta <= 0; hist_window_axil <= 0;
             hist_samples_meta <= 0; hist_samples_axil <= 0;
+            hist_reference_count_meta <= 0; hist_reference_count_axil <= 0;
+            hist_snapshot_count_meta <= 0; hist_snapshot_count_axil <= 0;
+            hist_range_min_meta <= 0; hist_range_min_axil <= 0;
+            hist_range_max_meta <= 0; hist_range_max_axil <= 0;
             update_selective_meta <= 0; update_selective_axil <= 0;
             update_clone_meta <= 0; update_clone_axil <= 0;
             update_error_meta <= 0; update_error_axil <= 0;
@@ -352,6 +354,14 @@ module driftadapt_control_regs #(
             hist_window_axil <= hist_window_meta;
             hist_samples_meta <= hist_completed_window_samples_axis;
             hist_samples_axil <= hist_samples_meta;
+            hist_reference_count_meta <= hist_reference_count_axis;
+            hist_reference_count_axil <= hist_reference_count_meta;
+            hist_snapshot_count_meta <= hist_snapshot_count_axis;
+            hist_snapshot_count_axil <= hist_snapshot_count_meta;
+            hist_range_min_meta <= hist_range_min_axis;
+            hist_range_min_axil <= hist_range_min_meta;
+            hist_range_max_meta <= hist_range_max_axis;
+            hist_range_max_axil <= hist_range_max_meta;
             update_selective_meta <= update_selective_mode_axis;
             update_selective_axil <= update_selective_meta;
             update_clone_meta <= update_clone_complete_axis;

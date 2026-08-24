@@ -18,11 +18,12 @@ and occasional model updates; it is not part of packet inference.
 The histogram tap observes the same accepted sixteen-feature packet as the DNN.
 It uses no prediction, label, teacher output, proxy score, or confusion counter.
 During the configured reference windows it learns signed Q8.8 minima/maxima and
-accumulates the reference histogram. Ranges then freeze. One feature is binned
-per cycle with fixed cross-multiply comparisons, well inside the DNN's 672-cycle
-packet interval; no divider, logarithm, floating-point unit, or backpressure is
-added. Two completed-window histogram banks track the existing two labeling
-windows, so the host always reads a stable matching snapshot.
+accumulates the reference histogram. Ranges then freeze. A bounded iterative
+add/compare datapath bins all features and serializes snapshot copying within
+the DNN's 672-cycle packet interval; no divider, logarithm, floating-point unit,
+or backpressure is added. Two completed-window histogram banks track the
+existing two labeling windows, so the host always reads a stable matching
+snapshot.
 
 `driftadapt_window_manager` assigns window and sample IDs and records sixteen
 feature-only values, the data-plane prediction, and
@@ -49,6 +50,8 @@ Important registers are:
 | `0x018` | R | labeling window size |
 | `0x020` | R | ready mask: bit 0 bank A, bit 1 bank B |
 | `0x024..0x038` | R | bank window ID, count, and first sample ID |
+| `0x044/0x048` | R | model version used for bank A/B inference |
+| `0x04c` | R | model version used by the most recently scored window |
 | `0x050..0x068` | R | most recently scored window and TP/TN/FP/FN/matches |
 | `0x06c` | R | number of labeled windows |
 | `0x070` | R | total labeled samples, 64-bit |
@@ -92,7 +95,9 @@ counters: 256 reference counters, 256 current accumulators, and two sets of 256
 stable snapshot counters. They require 32,768 bits (4,096 bytes). The 16 signed
 minimum/maximum pairs add 512 bits (64 bytes), for 33,280 bits (4,160 bytes) of
 reported histogram state. Small selectors, IDs, flags, and sample staging are
-control logic and are reported separately by implementation utilization.
+control logic and are reported separately by implementation utilization. The
+counter arrays remain local to the monitor; two narrow registered selector
+ports replace flattened 8,192-bit buses while preserving the register ABI.
 
 `run_online_adaptation.py` reads `drift.bins`, `threshold`,
 `consecutive_windows`, and `reference_windows` from the normal stimulation YAML.
@@ -121,6 +126,11 @@ Inference is blocked only during clone, verification, and the atomic switch. It
 may continue from the active bank while JTAG writes selective patches into the
 inactive bank. A failed unchanged-word comparison prevents the switch and does
 not increment the model version.
+
+The host verifies that its initial checkpoint quantizes to the exact 182 words
+embedded in the bitstream. Each window also records the model version used for
+its predictions, separately from the currently active bank version, so a
+queued pre-update window cannot be misreported as post-update inference.
 
 Host modes are:
 

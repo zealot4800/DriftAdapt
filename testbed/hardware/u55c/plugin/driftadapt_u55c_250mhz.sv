@@ -103,11 +103,16 @@ module driftadapt_u55c_250mhz #(
     wire hist_overflow_error;
     wire [31:0] hist_completed_window_id;
     wire [31:0] hist_completed_window_samples;
-    wire [8191:0] hist_reference_flat;
-    wire [8191:0] hist_snapshot0_flat;
-    wire [8191:0] hist_snapshot1_flat;
-    wire [255:0] hist_range_min_flat;
-    wire [255:0] hist_range_max_flat;
+    wire [16:0] host_hist_read_selector;
+    wire [31:0] host_hist_reference_count;
+    wire [31:0] host_hist_snapshot_count;
+    wire [31:0] host_hist_range_min;
+    wire [31:0] host_hist_range_max;
+    wire [16:0] shell_hist_read_selector;
+    wire [31:0] shell_hist_reference_count;
+    wire [31:0] shell_hist_snapshot_count;
+    wire [31:0] shell_hist_range_min;
+    wire [31:0] shell_hist_range_max;
 
     driftadapt_hist_monitor #(
         .WINDOW_SIZE(WINDOW_SIZE), .SAMPLE_COUNT(SAMPLE_COUNT),
@@ -121,11 +126,16 @@ module driftadapt_u55c_250mhz #(
         .overflow_error(hist_overflow_error),
         .completed_window_id(hist_completed_window_id),
         .completed_window_samples(hist_completed_window_samples),
-        .reference_hist_flat(hist_reference_flat),
-        .snapshot_hist0_flat(hist_snapshot0_flat),
-        .snapshot_hist1_flat(hist_snapshot1_flat),
-        .range_min_flat(hist_range_min_flat),
-        .range_max_flat(hist_range_max_flat)
+        .host_read_selector(host_hist_read_selector),
+        .host_reference_count(host_hist_reference_count),
+        .host_snapshot_count(host_hist_snapshot_count),
+        .host_range_min(host_hist_range_min),
+        .host_range_max(host_hist_range_max),
+        .shell_read_selector(shell_hist_read_selector),
+        .shell_reference_count(shell_hist_reference_count),
+        .shell_snapshot_count(shell_hist_snapshot_count),
+        .shell_range_min(shell_hist_range_min),
+        .shell_range_max(shell_hist_range_max)
     );
 
     wire weight_stage_valid;
@@ -282,11 +292,11 @@ module driftadapt_u55c_250mhz #(
         .hist_overflow_error_axis(hist_overflow_error),
         .hist_completed_window_id_axis(hist_completed_window_id),
         .hist_completed_window_samples_axis(hist_completed_window_samples),
-        .hist_reference_flat_axis(hist_reference_flat),
-        .hist_snapshot0_flat_axis(hist_snapshot0_flat),
-        .hist_snapshot1_flat_axis(hist_snapshot1_flat),
-        .hist_range_min_flat_axis(hist_range_min_flat),
-        .hist_range_max_flat_axis(hist_range_max_flat),
+        .hist_read_selector_axis(host_hist_read_selector),
+        .hist_reference_count_axis(host_hist_reference_count),
+        .hist_snapshot_count_axis(host_hist_snapshot_count),
+        .hist_range_min_axis(host_hist_range_min),
+        .hist_range_max_axis(host_hist_range_max),
         .online_complete_axis(online_complete),
         .total_captured_axis(total_captured),
         .total_labeled_axis(total_labeled),
@@ -368,11 +378,11 @@ module driftadapt_u55c_250mhz #(
         .hist_overflow_error_axis(hist_overflow_error),
         .hist_completed_window_id_axis(hist_completed_window_id),
         .hist_completed_window_samples_axis(hist_completed_window_samples),
-        .hist_reference_flat_axis(hist_reference_flat),
-        .hist_snapshot0_flat_axis(hist_snapshot0_flat),
-        .hist_snapshot1_flat_axis(hist_snapshot1_flat),
-        .hist_range_min_flat_axis(hist_range_min_flat),
-        .hist_range_max_flat_axis(hist_range_max_flat),
+        .hist_read_selector_axis(shell_hist_read_selector),
+        .hist_reference_count_axis(shell_hist_reference_count),
+        .hist_snapshot_count_axis(shell_hist_snapshot_count),
+        .hist_range_min_axis(shell_hist_range_min),
+        .hist_range_max_axis(shell_hist_range_max),
         .update_selective_mode_axis(update_selective_mode_status),
         .update_clone_complete_axis(update_clone_complete),
         .update_verify_error_axis(update_verify_error),

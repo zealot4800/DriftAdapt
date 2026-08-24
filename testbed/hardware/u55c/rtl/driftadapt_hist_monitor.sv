@@ -19,11 +19,16 @@ module driftadapt_hist_monitor #(
     output reg                               overflow_error,
     output reg  [31:0]                       completed_window_id,
     output reg  [31:0]                       completed_window_samples,
-    output wire [FEATURE_COUNT*BIN_COUNT*32-1:0] reference_hist_flat,
-    output wire [FEATURE_COUNT*BIN_COUNT*32-1:0] snapshot_hist0_flat,
-    output wire [FEATURE_COUNT*BIN_COUNT*32-1:0] snapshot_hist1_flat,
-    output wire [FEATURE_COUNT*16-1:0]        range_min_flat,
-    output wire [FEATURE_COUNT*16-1:0]        range_max_flat
+    input  wire [16:0]                       host_read_selector,
+    output reg  [31:0]                       host_reference_count,
+    output reg  [31:0]                       host_snapshot_count,
+    output reg  [31:0]                       host_range_min,
+    output reg  [31:0]                       host_range_max,
+    input  wire [16:0]                       shell_read_selector,
+    output reg  [31:0]                       shell_reference_count,
+    output reg  [31:0]                       shell_snapshot_count,
+    output reg  [31:0]                       shell_range_min,
+    output reg  [31:0]                       shell_range_max
 );
     localparam integer HIST_COUNT = FEATURE_COUNT * BIN_COUNT;
     localparam integer WINDOW_COUNT_WIDTH = $clog2(WINDOW_SIZE + 1);
@@ -41,8 +46,31 @@ module driftadapt_hist_monitor #(
     reg [255:0] pending_features;
     reg processing_sample;
     reg [3:0] feature_cursor;
+    reg [3:0] bin_candidate;
+    reg [3:0] selected_bin;
+    reg signed [31:0] bin_delta_scaled;
+    reg signed [31:0] bin_span;
+    reg signed [31:0] bin_threshold;
+    reg signed [15:0] prepared_minimum;
+    reg signed [15:0] prepared_maximum;
+    reg [2:0] feature_state;
+    reg [HIST_COUNT-1:0] histogram_write_enable;
+    reg [31:0] selected_reference_count;
+    reg [31:0] selected_current_count;
     reg pending_window_last;
     reg [31:0] pending_window_samples;
+    reg snapshot_copy_active;
+    reg snapshot_copy_bank;
+    reg [7:0] snapshot_copy_index;
+    reg [HIST_COUNT-1:0] snapshot_copy_enable;
+    (* ASYNC_REG = "TRUE" *) reg [16:0] shell_selector_meta;
+    (* ASYNC_REG = "TRUE" *) reg [16:0] shell_selector_axis;
+
+    localparam [2:0] RANGE_PREPARE = 3'd0;
+    localparam [2:0] BIN_PREPARE = 3'd1;
+    localparam [2:0] BIN_SEARCH = 3'd2;
+    localparam [2:0] WRITE_SELECT = 3'd3;
+    localparam [2:0] HISTOGRAM_UPDATE = 3'd4;
 
     integer reset_index;
 
@@ -55,33 +83,6 @@ module driftadapt_hist_monitor #(
                 data[(14 + index*2)*8 +: 8],
                 data[(15 + index*2)*8 +: 8]
             };
-        end
-    endfunction
-
-    // Equal-width bin selection without a divider.  Cross multiplication maps
-    // to fixed add/shift/compare logic for the constant sixteen-bin design.
-    function automatic [3:0] histogram_bin(
-        input signed [15:0] value,
-        input signed [15:0] minimum,
-        input signed [15:0] maximum
-    );
-        reg signed [31:0] delta;
-        reg signed [31:0] span;
-        integer candidate;
-        begin
-            histogram_bin = BIN_COUNT - 1;
-            if (maximum <= minimum || value <= minimum) begin
-                histogram_bin = 0;
-            end else if (value >= maximum) begin
-                histogram_bin = BIN_COUNT - 1;
-            end else begin
-                delta = value - minimum;
-                span = maximum - minimum;
-                for (candidate = 0; candidate < BIN_COUNT; candidate = candidate + 1)
-                    if (delta * BIN_COUNT < span * (candidate + 1) &&
-                        histogram_bin == BIN_COUNT - 1)
-                        histogram_bin = candidate[3:0];
-            end
         end
     endfunction
 
@@ -99,25 +100,16 @@ module driftadapt_hist_monitor #(
     wire signed [15:0] candidate_maximum =
         !range_valid[feature_cursor] ? current_feature :
         ((current_feature > range_max[feature_cursor]) ? current_feature : range_max[feature_cursor]);
-    wire [3:0] selected_bin = histogram_bin(
-        current_feature,
-        reference_ready ? range_min[feature_cursor] : candidate_minimum,
-        reference_ready ? range_max[feature_cursor] : candidate_maximum
-    );
+    wire signed [15:0] bin_minimum =
+        reference_ready ? range_min[feature_cursor] : candidate_minimum;
+    wire signed [15:0] bin_maximum =
+        reference_ready ? range_max[feature_cursor] : candidate_maximum;
     wire [7:0] selected_histogram_index = feature_cursor * BIN_COUNT + selected_bin;
 
-    genvar output_index;
-    generate
-        for (output_index = 0; output_index < HIST_COUNT; output_index = output_index + 1) begin : flatten_histograms
-            assign reference_hist_flat[output_index*32 +: 32] = reference_hist[output_index];
-            assign snapshot_hist0_flat[output_index*32 +: 32] = snapshot_hist0[output_index];
-            assign snapshot_hist1_flat[output_index*32 +: 32] = snapshot_hist1[output_index];
-        end
-        for (output_index = 0; output_index < FEATURE_COUNT; output_index = output_index + 1) begin : flatten_ranges
-            assign range_min_flat[output_index*16 +: 16] = range_min[output_index];
-            assign range_max_flat[output_index*16 +: 16] = range_max[output_index];
-        end
-    endgenerate
+    wire [7:0] host_read_index = {host_read_selector[3:0], host_read_selector[11:8]};
+    wire [3:0] host_read_feature = host_read_selector[3:0];
+    wire [7:0] shell_read_index = {shell_selector_axis[3:0], shell_selector_axis[11:8]};
+    wire [3:0] shell_read_feature = shell_selector_axis[3:0];
 
     initial begin
         if (FEATURE_COUNT != 16 || BIN_COUNT != 16)
@@ -140,8 +132,33 @@ module driftadapt_hist_monitor #(
             pending_features <= 0;
             processing_sample <= 1'b0;
             feature_cursor <= 0;
+            bin_candidate <= 0;
+            selected_bin <= 0;
+            bin_delta_scaled <= 0;
+            bin_span <= 0;
+            bin_threshold <= 0;
+            prepared_minimum <= 0;
+            prepared_maximum <= 0;
+            feature_state <= RANGE_PREPARE;
+            histogram_write_enable <= 0;
+            selected_reference_count <= 0;
+            selected_current_count <= 0;
             pending_window_last <= 1'b0;
             pending_window_samples <= 0;
+            snapshot_copy_active <= 1'b0;
+            snapshot_copy_bank <= 1'b0;
+            snapshot_copy_index <= 0;
+            snapshot_copy_enable <= 0;
+            shell_selector_meta <= 0;
+            shell_selector_axis <= 0;
+            host_reference_count <= 0;
+            host_snapshot_count <= 0;
+            host_range_min <= 0;
+            host_range_max <= 0;
+            shell_reference_count <= 0;
+            shell_snapshot_count <= 0;
+            shell_range_min <= 0;
+            shell_range_max <= 0;
             for (reset_index = 0; reset_index < HIST_COUNT; reset_index = reset_index + 1) begin
                 reference_hist[reset_index] <= 0;
                 current_hist[reset_index] <= 0;
@@ -153,11 +170,33 @@ module driftadapt_hist_monitor #(
                 range_max[reset_index] <= 0;
             end
         end else begin
+            shell_selector_meta <= shell_read_selector;
+            shell_selector_axis <= shell_selector_meta;
+
+            // Keep the large counter arrays local.  Only the selected words
+            // cross module boundaries, preserving the control-register ABI
+            // without routing three flattened 8,192-bit buses.
+            host_reference_count <= reference_hist[host_read_index];
+            host_snapshot_count <= host_read_selector[16] ?
+                snapshot_hist1[host_read_index] : snapshot_hist0[host_read_index];
+            host_range_min <= {{16{range_min[host_read_feature][15]}},
+                               range_min[host_read_feature]};
+            host_range_max <= {{16{range_max[host_read_feature][15]}},
+                               range_max[host_read_feature]};
+            shell_reference_count <= reference_hist[shell_read_index];
+            shell_snapshot_count <= shell_selector_axis[16] ?
+                snapshot_hist1[shell_read_index] : snapshot_hist0[shell_read_index];
+            shell_range_min <= {{16{range_min[shell_read_feature][15]}},
+                                range_min[shell_read_feature]};
+            shell_range_max <= {{16{range_max[shell_read_feature][15]}},
+                                range_max[shell_read_feature]};
+
             // The DNN accepts a packet every 672 cycles.  This monitor consumes
-            // one of its sixteen features per cycle, so it adds no backpressure
-            // and uses a single fixed bin-selector datapath.
+            // at most 320 cycles for a packet and 256 cycles for a completed
+            // window snapshot, so it adds no backpressure.  Bin search and
+            // snapshot transfer are serialized to keep the 250 MHz path short.
             if (sample_accept) begin
-                if (processing_sample) begin
+                if (processing_sample || snapshot_copy_active) begin
                     overflow_error <= 1'b1;
                 end else begin
                     for (reset_index = 0; reset_index < FEATURE_COUNT; reset_index = reset_index + 1)
@@ -165,6 +204,7 @@ module driftadapt_hist_monitor #(
                             packet_feature_q8(sample_tdata, reset_index);
                     processing_sample <= 1'b1;
                     feature_cursor <= 0;
+                    feature_state <= RANGE_PREPARE;
                     pending_window_last <=
                         window_sample_count == WINDOW_SIZE - 1 ||
                         total_sample_count == SAMPLE_COUNT - 1;
@@ -178,49 +218,116 @@ module driftadapt_hist_monitor #(
                 end
             end
 
-            if (processing_sample) begin
-                if (!reference_ready) begin
-                    range_min[feature_cursor] <= candidate_minimum;
-                    range_max[feature_cursor] <= candidate_maximum;
-                    range_valid[feature_cursor] <= 1'b1;
-                    if (&reference_hist[selected_histogram_index])
-                        overflow_error <= 1'b1;
-                    reference_hist[selected_histogram_index] <=
-                        saturating_increment(reference_hist[selected_histogram_index]);
-                end
-                if (&current_hist[selected_histogram_index])
-                    overflow_error <= 1'b1;
-
-                if (pending_window_last && feature_cursor == FEATURE_COUNT - 1) begin
-                    for (reset_index = 0; reset_index < HIST_COUNT; reset_index = reset_index + 1) begin
-                        if (!next_window_id[0])
-                            snapshot_hist0[reset_index] <=
-                                (reset_index == selected_histogram_index) ?
-                                saturating_increment(current_hist[reset_index]) : current_hist[reset_index];
+            if (snapshot_copy_active) begin
+                for (reset_index = 0; reset_index < HIST_COUNT; reset_index = reset_index + 1) begin
+                    if (snapshot_copy_enable[reset_index]) begin
+                        if (!snapshot_copy_bank)
+                            snapshot_hist0[reset_index] <= current_hist[reset_index];
                         else
-                            snapshot_hist1[reset_index] <=
-                                (reset_index == selected_histogram_index) ?
-                                saturating_increment(current_hist[reset_index]) : current_hist[reset_index];
+                            snapshot_hist1[reset_index] <= current_hist[reset_index];
                         current_hist[reset_index] <= 0;
                     end
-                end else begin
-                    current_hist[selected_histogram_index] <=
-                        saturating_increment(current_hist[selected_histogram_index]);
                 end
 
-                if (feature_cursor == FEATURE_COUNT - 1) begin
-                    processing_sample <= 1'b0;
-                    if (pending_window_last) begin
-                        completed_window_id <= next_window_id;
-                        completed_window_samples <= pending_window_samples;
-                        snapshot_valid <= 1'b1;
-                        next_window_id <= next_window_id + 1'b1;
-                        if (next_window_id + 1'b1 == REFERENCE_WINDOWS)
-                            reference_ready <= 1'b1;
-                    end
+                if (snapshot_copy_index == HIST_COUNT - 1) begin
+                    snapshot_copy_active <= 1'b0;
+                    snapshot_copy_index <= 0;
+                    snapshot_copy_enable <= 0;
+                    completed_window_id <= next_window_id;
+                    completed_window_samples <= pending_window_samples;
+                    snapshot_valid <= 1'b1;
+                    next_window_id <= next_window_id + 1'b1;
+                    if (next_window_id + 1'b1 == REFERENCE_WINDOWS)
+                        reference_ready <= 1'b1;
                 end else begin
-                    feature_cursor <= feature_cursor + 1'b1;
+                    snapshot_copy_index <= snapshot_copy_index + 1'b1;
+                    snapshot_copy_enable <= snapshot_copy_enable << 1;
                 end
+            end else if (processing_sample) begin
+                case (feature_state)
+                    RANGE_PREPARE: begin
+                        if (!reference_ready) begin
+                            range_min[feature_cursor] <= candidate_minimum;
+                            range_max[feature_cursor] <= candidate_maximum;
+                            range_valid[feature_cursor] <= 1'b1;
+                        end
+                        prepared_minimum <= bin_minimum;
+                        prepared_maximum <= bin_maximum;
+                        feature_state <= BIN_PREPARE;
+                    end
+
+                    BIN_PREPARE: begin
+                        if (prepared_maximum <= prepared_minimum ||
+                            current_feature <= prepared_minimum) begin
+                            selected_bin <= 0;
+                            feature_state <= WRITE_SELECT;
+                        end else if (current_feature >= prepared_maximum) begin
+                            selected_bin <= BIN_COUNT - 1;
+                            feature_state <= WRITE_SELECT;
+                        end else begin
+                            bin_candidate <= 0;
+                            bin_delta_scaled <=
+                                ($signed(current_feature) - $signed(prepared_minimum)) <<< 4;
+                            bin_span <= $signed(prepared_maximum) - $signed(prepared_minimum);
+                            bin_threshold <= $signed(prepared_maximum) - $signed(prepared_minimum);
+                            feature_state <= BIN_SEARCH;
+                        end
+                    end
+
+                    BIN_SEARCH: begin
+                        if (bin_delta_scaled < bin_threshold || bin_candidate == BIN_COUNT - 1) begin
+                            selected_bin <= bin_candidate;
+                            feature_state <= WRITE_SELECT;
+                        end else begin
+                            bin_candidate <= bin_candidate + 1'b1;
+                            bin_threshold <= bin_threshold + bin_span;
+                        end
+                    end
+
+                    WRITE_SELECT: begin
+                        histogram_write_enable <= 0;
+                        histogram_write_enable[selected_histogram_index] <= 1'b1;
+                        selected_reference_count <=
+                            reference_hist[selected_histogram_index];
+                        selected_current_count <=
+                            current_hist[selected_histogram_index];
+                        feature_state <= HISTOGRAM_UPDATE;
+                    end
+
+                    HISTOGRAM_UPDATE: begin
+                        if (&selected_current_count ||
+                            (!reference_ready && &selected_reference_count))
+                            overflow_error <= 1'b1;
+                        for (reset_index = 0; reset_index < HIST_COUNT; reset_index = reset_index + 1) begin
+                            if (histogram_write_enable[reset_index]) begin
+                                if (!reference_ready) begin
+                                    reference_hist[reset_index] <=
+                                        saturating_increment(selected_reference_count);
+                                end
+                                current_hist[reset_index] <=
+                                    saturating_increment(selected_current_count);
+                            end
+                        end
+                        histogram_write_enable <= 0;
+
+                        if (feature_cursor == FEATURE_COUNT - 1) begin
+                            processing_sample <= 1'b0;
+                            if (pending_window_last) begin
+                                snapshot_copy_active <= 1'b1;
+                                snapshot_copy_bank <= next_window_id[0];
+                                snapshot_copy_index <= 0;
+                                snapshot_copy_enable <= {{(HIST_COUNT-1){1'b0}}, 1'b1};
+                            end
+                        end else begin
+                            feature_cursor <= feature_cursor + 1'b1;
+                            feature_state <= RANGE_PREPARE;
+                        end
+                    end
+
+                    default: begin
+                        feature_state <= RANGE_PREPARE;
+                    end
+                endcase
             end
         end
     end
