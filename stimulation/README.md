@@ -1,11 +1,10 @@
-# Minimal DRIFTADAPT baseline
+# DriftAdapt simulation
 
-This directory is a compact implementation of the DRIFTADAPT online-learning
-pipeline from the official OSDI '24 artifact. It contains only streaming data
-loading, the artifact's required MLPs and labelers, retraining triggers,
-full-model training, selective hidden-module adaptation, label-free drift and
-impact localization, bounded trusted labeling/replay, candidate validation,
-metrics, official workloads, and official checkpoints.
+This directory contains the CARAVAN baseline and the experimental
+drift-conditioned DriftAdapt workflow. Both use the same streaming datasets,
+MLPs, feature ordering, checkpoints, histogram/JSD drift monitor, and result
+formats. The runtime interface intentionally exposes only `caravan` and
+`drift_conditioned`.
 
 ## Install and run
 
@@ -13,7 +12,7 @@ Use Python 3.10 or newer in a virtual environment:
 
 ```bash
 python -m pip install -r requirements.txt
-python run.py --config configs/cic-ids2017.yaml
+python run.py --config configs/cic-ids2017.yaml --mode caravan
 ```
 
 On a CPU-only host, install the CPU wheel before the requirements to avoid
@@ -35,7 +34,7 @@ an OpenAI account, API key, or Internet access after the model is installed:
 
 ```bash
 ollama pull llama2:7b
-python run.py --config configs/unsw-nb15.yaml --local
+python run.py --config configs/unsw-nb15.yaml --mode caravan --local
 ```
 
 Local-model settings live in the project-root `.env` file:
@@ -69,7 +68,7 @@ OPENAI_MAX_RETRIES=3
 Then select the cloud provider with the same configuration:
 
 ```bash
-python run.py --config configs/unsw-nb15.yaml --cloud
+python run.py --config configs/unsw-nb15.yaml --mode caravan --cloud
 ```
 
 The `--local` and `--cloud` flags are mutually exclusive; the shorter aliases
@@ -95,16 +94,121 @@ feature is reported as drifted. This monitor observes only input features.
 Results include per-feature JSD scores, drifted indices and names, and the
 fixed histogram counter/state cost for later hardware sizing.
 
-`driftadapt.mode` selects one of three policies. `baseline_caravan` labels each
-complete window, uses the original accuracy-proxy trigger, and fully retrains
-the active model. `driftadapt_full` and `driftadapt_selective` use persistent
-feature drift, impact localization, and bounded sample selection. Selected
-samples pass through confidence plus embedding-distance OOD knownness; unknown
-samples use the configured fallback. Trusted samples can be combined with
-bounded FIFO replay. Adaptation trains a copied candidate, validates it only on
-trusted labels, and deploys it by incrementing the model version only when the
-validation tolerance is met. Selective candidates always train the classifier
-and fall back to full retraining when impacted coverage is high.
+`driftadapt.mode` selects one of two runtime policies:
+
+- `caravan` labels every complete window, applies the original accuracy-proxy
+  trigger, fully retrains the active model, and preserves the CARAVAN baseline.
+- `drift_conditioned` uses persistent feature drift, a feature-only signature,
+  and a validated learned adapter to repair selected model parameters without
+  runtime labeling or gradient retraining.
+
+The old `baseline_caravan` spelling is accepted as a deprecated alias for
+`caravan`.
+
+`drift_conditioned` adds a teacher-free runtime path:
+
+```text
+feature-only histogram/JSD drift
+  -> 5-value signature per feature
+  -> small drift adapter
+  -> predicted hidden modules, magnitudes, and confidence
+  -> nearest learned oracle-repair prototype per predicted module
+  -> matching small final-classifier repair
+  -> repair a copied candidate model
+  -> deploy only above the configured confidence threshold
+```
+
+Each feature contributes JSD, normalized mean shift, normalized standard-
+deviation shift, normalized median shift, and mean-shift direction. Runtime
+signature generation accepts feature and histogram state only; it has no label
+input and does not construct or call the teacher. The adapter is not a full-weight
+hypernetwork. It predicts hidden-module selection and normalized magnitude and
+scales the closest offline parameter-delta prototype for each selected module.
+The repair also carries the matching final-classifier delta. This is required
+because a hidden-only repair cannot reproduce an oracle whose classifier was
+adapted, while keeping the adapter output module-oriented and explicit.
+
+Ground-truth labels produce oracle repair targets in the offline workflow and
+calculate simulation evaluation metrics. They are never part of the drift
+signature or adapter input, and runtime `drift_conditioned` never performs
+gradient retraining. Oracle retraining is confined to offline artifact
+generation and evaluation.
+
+Repair deltas are defined relative to the checkpoint used to generate the
+offline dataset. Runtime therefore rebuilds each candidate from that checkpoint
+and resolves selected parameters as `checkpoint + delta`, rather than retaining
+stale repairs or accumulating deltas across drift episodes. Adapter
+checkpoints include and validate the exact model fingerprint,
+feature order, histogram width/reference length, signature clip, parameter
+schema, and scientific-validation status before use.
+
+### Offline drift-conditioned workflow
+
+Generate controlled single-feature and multi-feature scenarios. Lower-severity
+single-feature scenarios form the training split; the highest severity and all
+feature combinations are held out for scientific evaluation. Feature pairs are
+selected with balanced feature coverage. Oracle optimization uses the first
+post-reference traffic window, while every oracle and predicted repair is
+scored on the next disjoint traffic window.
+
+```bash
+cd stimulation
+.venv/bin/python scripts/generate_drift_dataset.py \
+  --config configs/cic-ids2017.yaml \
+  --output results/cic-ids2017-drift-repair.pt \
+  --severities 0.5,1.0,2.0 \
+  --directions=-1,1 \
+  --max-feature-pairs 16 \
+  --oracle-epochs 10 \
+  --module-threshold 0.80
+```
+
+Train the adapter and produce the learnability/generalization report:
+
+```bash
+.venv/bin/python scripts/train_drift_adapter.py \
+  --config configs/cic-ids2017.yaml \
+  --dataset results/cic-ids2017-drift-repair.pt \
+  --output checkpoint/cic-ids2017-drift-adapter.pt \
+  --report results/cic-ids2017-drift-adapter.report.json
+```
+
+The report contains drift-signature similarity, oracle-repair similarity,
+their correlation, module-prediction accuracy, recovery ratio, and separate
+held-out results for unseen severities and feature combinations. Meaningful
+held-out recovery should be demonstrated before changing the hardware testbed.
+The report's `scientific_validation_passed` gate defaults to requiring at least
+`0.30` pooled held-out signature/repair similarity correlation, `0.70`
+held-out module accuracy, `0.50` held-out recovery ratio, and a `0.50` rate of
+held-out scenarios where oracle adaptation actually improves F1. Scenarios
+without positive oracle gain are reported but excluded from recovery-ratio
+averages. These thresholds are explicit CLI options rather than an implicit
+claim of success. The script always writes the report, but writes a deployable
+adapter checkpoint only when every gate passes.
+The evaluated confidence and module thresholds are stored in the checkpoint;
+changing either runtime threshold requires regenerating the validated adapter.
+
+After producing the checkpoint, run the new policy:
+
+```bash
+.venv/bin/python run.py \
+  --config configs/cic-ids2017.yaml \
+  --mode drift_conditioned
+```
+
+Its optional configuration does not change the existing default policy:
+
+```yaml
+drift_conditioned:
+  adapter_checkpoint: ../checkpoint/cic-ids2017-drift-adapter.pt
+  confidence_threshold: 0.50
+  module_threshold: 0.50
+  signature_shift_clip: 8.0
+```
+
+Confidence below the threshold leaves the model unchanged; it does not invoke
+the teacher or gradient retraining as an implicit fallback. Oracle retraining
+is confined to the offline dataset-generation command above.
 
 ## CIC-IDS2017 traffic-drift run
 
@@ -115,14 +219,13 @@ boundary during execution; it evaluates every window normally. Configuration
 segment lengths preserve the artifact's original per-workload standardization.
 
 ```bash
-python run.py --config configs/cic-ids2017.yaml --mode baseline_caravan
-python run.py --config configs/cic-ids2017.yaml --mode driftadapt_full
-python run.py --config configs/cic-ids2017.yaml --mode driftadapt_selective
+python run.py --config configs/cic-ids2017.yaml --mode caravan
+python run.py --config configs/cic-ids2017.yaml --mode drift_conditioned
 ```
 
 The optional CLI flag overrides `driftadapt.mode`; without it, the YAML value
-is used. The previous `--adaptation-mode full|selective` spelling remains as a
-legacy alias for CARAVAN full and DriftAdapt selective respectively.
+is used. `--mode baseline_caravan` remains temporarily accepted as a deprecated
+CARAVAN alias.
 
 To regenerate the feature and model memories consumed by the U55C image:
 

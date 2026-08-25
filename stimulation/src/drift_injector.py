@@ -13,11 +13,14 @@ class TrafficDriftInjector:
         configured_end = config.get("end_window")
         self.end_window = int(configured_end) if configured_end is not None else None
         self.magnitude = float(config.get("magnitude", 0.0))
+        self.direction = int(config.get("direction", 1))
         self.feature_names = feature_names
         if self.kind not in {"abrupt", "gradual", "recurrent"}:
             raise ValueError("drift_injection.type must be abrupt, gradual, or recurrent")
         if self.start_window < 1 or self.magnitude < 0:
             raise ValueError("drift injection start_window must be positive and magnitude nonnegative")
+        if self.direction not in {-1, 1}:
+            raise ValueError("drift_injection.direction must be -1 or 1")
         if self.kind in {"gradual", "recurrent"} and self.end_window is None:
             raise ValueError(f"drift_injection.end_window is required for {self.kind} drift")
         if self.end_window is not None and self.end_window < self.start_window:
@@ -44,18 +47,22 @@ class TrafficDriftInjector:
             return False, None, self.start_window, 0.0
         if self.kind == "abrupt":
             active = self.end_window is None or window_index <= self.end_window
-            return active, 1 if active else None, self.start_window, self.magnitude if active else 0.0
+            return active, 1 if active else None, self.start_window, (
+                self.direction * self.magnitude if active else 0.0
+            )
         if self.kind == "gradual":
             duration = self.end_window - self.start_window + 1
             progress = min(1.0, (window_index - self.start_window + 1) / duration)
-            return True, 1, self.start_window, self.magnitude * progress
+            return True, 1, self.start_window, self.direction * self.magnitude * progress
 
         duration = self.end_window - self.start_window + 1
         period_index = (window_index - self.start_window) // duration
         active = period_index % 2 == 0
         event_id = period_index // 2 + 1
         event_start = self.start_window + (event_id - 1) * 2 * duration
-        return active, event_id if active else None, event_start, self.magnitude if active else 0.0
+        return active, event_id if active else None, event_start, (
+            self.direction * self.magnitude if active else 0.0
+        )
 
     @torch.inference_mode()
     def apply(self, features: torch.Tensor, window_index: int) -> tuple[torch.Tensor, dict]:
@@ -72,6 +79,7 @@ class TrafficDriftInjector:
             "true_drifted_feature_names": [self.feature_names[index] for index in self.feature_indices],
             "injected_drift_type": self.kind if self.enabled else None,
             "true_drift_magnitude": self.magnitude if self.enabled else 0.0,
+            "true_drift_direction": self.direction if self.enabled else 0,
             "applied_drift_magnitude": applied_magnitude,
         }
 
@@ -100,6 +108,7 @@ class TrafficDriftInjector:
                 "true_drifted_feature_names": metadata["true_drifted_feature_names"],
                 "drift_type": self.kind,
                 "magnitude": self.magnitude,
+                "direction": self.direction,
                 "detection_delay": None,
                 "feature_localization_precision": 0.0,
                 "feature_localization_recall": 0.0,

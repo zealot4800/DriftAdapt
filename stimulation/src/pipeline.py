@@ -8,16 +8,21 @@ from pathlib import Path
 import pandas as pd
 import torch
 
+from .adapter import load_adapter_bundle, predict_repair
 from .data import StreamingDataset, resolve_path
 from .drift import COUNTER_BITS, FeatureHistogramDriftDetector
 from .drift_injector import TrafficDriftInjector
-from .impact import map_drift_to_neural_impact
-from .labelers import ABSTAIN, HierarchicalLabeler, build_labeler
+from .drift_signature import build_drift_signature
+from .labelers import ABSTAIN, build_labeler
 from .metrics import macro_f1, mean
 from .models import build_model, load_checkpoint
-from .selector import select_drift_associated_samples
-from .trainer import ReplayBuffer, form_training_set, retrain_model, selective_retrain_model
+from .repair import apply_repair_plan
+from .trainer import form_training_set, retrain_model
 from .trigger import RetrainingTrigger
+
+
+SUPPORTED_POLICIES = {"caravan", "drift_conditioned"}
+DEPRECATED_POLICY_ALIASES = {"baseline_caravan": "caravan"}
 
 
 class DriftAdaptPipeline:
@@ -55,68 +60,75 @@ class DriftAdaptPipeline:
         load_checkpoint(self.model, str(checkpoint), self.device)
         self.model.eval()
         self.static_model = copy.deepcopy(self.model).eval()
+        self.repair_base_model = copy.deepcopy(self.model).eval()
 
-        labeler_config = copy.deepcopy(config["labeler"])
-        labeler_config.setdefault("feature_names", dataset_config["feature_names"])
-        if labeler_config.get("checkpoint"):
-            labeler_config["checkpoint"] = str(resolve_path(labeler_config["checkpoint"], base))
-        self.labeler = build_labeler(labeler_config, self.device)
-        self.trusted_labeler = HierarchicalLabeler(
-            self.labeler, config.get("labeling", {}), int(dataset_config["num_classes"]),
-        )
-        self.optimizer = None
-        adaptation = config.get("adaptation", {})
-        self.impact_threshold = float(adaptation.get("impact_threshold", 0.30))
-        if not 0.0 <= self.impact_threshold <= 1.0:
-            raise ValueError("adaptation.impact_threshold must be between 0 and 1")
         policy = config.get("driftadapt", {})
-        self.policy_mode = str(policy.get("mode", "baseline_caravan")).lower()
-        if self.policy_mode not in {
-            "baseline_caravan", "driftadapt_full", "driftadapt_selective",
-        }:
-            raise ValueError("driftadapt.mode must be baseline_caravan, driftadapt_full, or driftadapt_selective")
-        self.min_labeled_samples = int(policy.get("min_labeled_samples", 64))
-        self.full_retrain_threshold = float(policy.get("full_retrain_threshold", 0.70))
-        self.parameter_bits = int(policy.get("parameter_bits", 32))
-        if self.min_labeled_samples < 1 or self.parameter_bits < 1:
-            raise ValueError("DriftAdapt sample and parameter precision settings must be positive")
-        if not 0.0 <= self.full_retrain_threshold <= 1.0:
-            raise ValueError("driftadapt.full_retrain_threshold must be between 0 and 1")
+        configured_mode = str(policy.get("mode", "caravan")).lower()
+        self.policy_mode = DEPRECATED_POLICY_ALIASES.get(configured_mode, configured_mode)
+        if self.policy_mode not in SUPPORTED_POLICIES:
+            if configured_mode in {"driftadapt_full", "driftadapt_selective"}:
+                raise ValueError(
+                    f"Runtime mode {configured_mode!r} was removed; use 'caravan' "
+                    "or 'drift_conditioned'"
+                )
+            raise ValueError("driftadapt.mode must be caravan or drift_conditioned")
 
-        selection = config.get("sample_selection", {})
-        self.sample_selection_enabled = bool(selection.get("enabled", True))
-        self.max_selected_samples = int(selection.get("max_samples", self.min_labeled_samples))
-        replay = config.get("replay", {})
-        self.replay_enabled = bool(replay.get("enabled", False))
-        self.replay_samples_per_update = int(replay.get("samples_per_update", 0))
-        replay_capacity = int(replay.get("capacity", 1000))
-        if self.replay_enabled and replay_capacity < 1:
-            raise ValueError("replay.capacity must be positive when replay is enabled")
-        self.replay = ReplayBuffer(
-            max(replay_capacity, 1), len(dataset_config["feature_names"]), self.device,
-        )
-        validation = config.get("validation", {})
-        self.validation_enabled = bool(validation.get("enabled", True))
-        self.max_validation_f1_drop = float(validation.get("max_f1_drop", 0.02))
-        if self.max_selected_samples < 1 or self.replay_samples_per_update < 0:
-            raise ValueError("Sample-selection and replay sample counts must be valid")
-        if not 0.0 <= self.max_validation_f1_drop <= 1.0:
-            raise ValueError("validation.max_f1_drop must be between 0 and 1")
+        self.parameter_bits = int(policy.get("parameter_bits", 32))
+        if self.parameter_bits < 1:
+            raise ValueError("driftadapt.parameter_bits must be positive")
+        self.labeler = None
+        self.labeler_type = None
+        self.trigger = None
+        self.optimizer = None
+        if self.policy_mode == "caravan":
+            labeler_config = copy.deepcopy(config["labeler"])
+            labeler_config.setdefault("feature_names", dataset_config["feature_names"])
+            if labeler_config.get("checkpoint"):
+                labeler_config["checkpoint"] = str(
+                    resolve_path(labeler_config["checkpoint"], base)
+                )
+            self.labeler = build_labeler(labeler_config, self.device)
+            self.labeler_type = str(labeler_config["type"]).lower()
+            trigger_config = config["trigger"]
+            if trigger_config.get("type") != "accuracy_proxy":
+                raise ValueError("CARAVAN requires trigger.type: accuracy_proxy")
+            self.trigger = RetrainingTrigger(
+                threshold=float(trigger_config["threshold"]),
+                drop_threshold=float(trigger_config.get("drop_threshold", 0.15)),
+                consecutive_windows=int(trigger_config.get("consecutive_windows", 2)),
+            )
+
+        conditioned = config.get("drift_conditioned", {})
+        self.adapter_bundle = None
+        self.adapter_confidence_threshold = float(conditioned.get("confidence_threshold", 0.50))
+        self.adapter_module_threshold = float(conditioned.get("module_threshold", 0.50))
+        self.signature_shift_clip = float(conditioned.get("signature_shift_clip", 8.0))
+        if not 0.0 <= self.adapter_confidence_threshold <= 1.0:
+            raise ValueError("drift_conditioned.confidence_threshold must be between zero and one")
+        if not 0.0 <= self.adapter_module_threshold <= 1.0:
+            raise ValueError("drift_conditioned.module_threshold must be between zero and one")
+        if self.signature_shift_clip <= 0:
+            raise ValueError("drift_conditioned.signature_shift_clip must be positive")
+        if self.policy_mode == "drift_conditioned":
+            checkpoint_value = conditioned.get("adapter_checkpoint")
+            if not checkpoint_value:
+                raise ValueError(
+                    "drift_conditioned.adapter_checkpoint is required for drift_conditioned mode"
+                )
+            self.adapter_bundle = load_adapter_bundle(
+                resolve_path(checkpoint_value, base), self.model, self.device,
+                feature_names=list(dataset_config["feature_names"]),
+                signature_config={
+                    "bins": int(drift_config.get("bins", 16)),
+                    "reference_windows": int(drift_config.get("reference_windows", 10)),
+                    "normalized_shift_clip": self.signature_shift_clip,
+                },
+                confidence_threshold=self.adapter_confidence_threshold,
+                module_threshold=self.adapter_module_threshold,
+            )
         self.model_version = 0
-        self.previous_model = copy.deepcopy(self.model).eval()
-        self.pending_features = self.dataset.features[:0]
-        self.pending_labels = self.dataset.labels[:0]
-        self.pending_capacity = max(self.min_labeled_samples * 4, self.max_selected_samples)
-        self.pending_labeling_time = 0.0
         self.drift_event_handled = False
-        trigger_config = config["trigger"]
-        if trigger_config.get("type") != "accuracy_proxy":
-            raise ValueError("This drift-only implementation requires trigger.type: accuracy_proxy")
-        self.trigger = RetrainingTrigger(
-            threshold=float(trigger_config["threshold"]),
-            drop_threshold=float(trigger_config.get("drop_threshold", 0.15)),
-            consecutive_windows=int(trigger_config.get("consecutive_windows", 2)),
-        )
+        self.last_non_drift_f1: float | None = None
         self.base_dir = base
 
     @torch.inference_mode()
@@ -139,161 +151,79 @@ class DriftAdaptPipeline:
             "teacher_known_decisions": [],
         }
 
-    def _append_pending(self, features: torch.Tensor, labels: torch.Tensor) -> None:
-        if labels.numel() == 0:
-            return
-        self.pending_features = torch.cat((self.pending_features, features))[-self.pending_capacity:]
-        self.pending_labels = torch.cat((self.pending_labels, labels))[-self.pending_capacity:]
-
-    def _candidate_adaptation(
-        self,
-        selected_modules: list[str],
-        training: dict,
-        balance_binary: bool,
-    ) -> dict:
-        replay_x, replay_y = self.replay.sample(
-            self.replay_samples_per_update if self.replay_enabled else 0
-        )
-        combined_x = torch.cat((self.pending_features, replay_x))
-        combined_y = torch.cat((self.pending_labels, replay_y))
-        validation_count = (
-            min(max(1, combined_y.numel() // 5), 64)
-            if self.validation_enabled and combined_y.numel() >= 5 else 0
-        )
-        if validation_count:
-            train_x, validation_x = combined_x[:-validation_count], combined_x[-validation_count:]
-            train_y, validation_y = combined_y[:-validation_count], combined_y[-validation_count:]
-        else:
-            train_x, train_y = combined_x, combined_y
-            validation_x, validation_y = combined_x[:0], combined_y[:0]
-        train_x, train_y = form_training_set(train_x, train_y, balance_binary=balance_binary)
-        if train_x is None:
-            return {"adaptation_event": False}
-
-        candidate = copy.deepcopy(self.model)
-        hidden_count = max(len(candidate.named_hidden_modules()), 1)
-        impacted_parameters = sum(
-            parameter.numel()
-            for name in selected_modules
-            for parameter in candidate.named_hidden_modules()[name].parameters()
-        )
-        total_parameters = sum(parameter.numel() for parameter in candidate.parameters())
-        impacted_fraction = max(
-            impacted_parameters / total_parameters,
-            len(selected_modules) / hidden_count,
-        )
-        actual_mode = "full" if (
-            self.policy_mode == "driftadapt_full"
-            or impacted_fraction >= self.full_retrain_threshold
-        ) else "selective"
-
-        if actual_mode == "full":
-            for parameter in candidate.parameters():
-                parameter.requires_grad_(True)
-            training_time, _ = retrain_model(
-                candidate, train_x, train_y,
-                epochs=int(training["epochs"]), batch_size=int(training["batch_size"]),
-                learning_rate=float(training["learning_rate"]),
-                optimizer_name=training.get("optimizer", "Adam"), optimizer=None,
-            )
-            adapted_modules = list(candidate.named_hidden_modules())
-        else:
-            training_time, _ = selective_retrain_model(
-                candidate, train_x, train_y, selected_modules,
-                epochs=int(training["epochs"]), batch_size=int(training["batch_size"]),
-                learning_rate=float(training["learning_rate"]),
-                optimizer_name=training.get("optimizer", "Adam"),
-            )
-            adapted_modules = selected_modules
-
-        updated_parameters = sum(
-            parameter.numel() for parameter in candidate.parameters() if parameter.requires_grad
-        )
-        validation_started = time.perf_counter()
-        active_validation_f1 = None
-        candidate_validation_f1 = None
-        accepted = True
-        if self.validation_enabled and validation_y.numel() > 0:
-            active_validation_f1 = macro_f1(
-                validation_y, self._predict(self.model, validation_x),
-            )
-            candidate_validation_f1 = macro_f1(
-                validation_y, self._predict(candidate, validation_x),
-            )
-            accepted = (
-                candidate_validation_f1 + self.max_validation_f1_drop
-                >= active_validation_f1
-            )
-        validation_time = time.perf_counter() - validation_started
-        if accepted:
-            self.previous_model = copy.deepcopy(self.model).eval()
-            self.model = candidate.eval()
-            self.model_version += 1
-
-        return {
-            "adaptation_event": True,
-            "training_sample_count": int(train_y.numel()),
-            "adaptation_mode": actual_mode,
-            "selected_modules": adapted_modules,
-            "total_parameters": total_parameters,
-            "trainable_parameters": updated_parameters,
-            "parameter_update_percentage": 100.0 * updated_parameters / total_parameters,
-            "updated_parameters": updated_parameters,
-            "updated_parameter_percentage": 100.0 * updated_parameters / total_parameters,
-            "estimated_parameter_update_bytes": (
-                updated_parameters * self.parameter_bits + 7
-            ) // 8,
-            "training_time": training_time,
-            "candidate_validation_time": validation_time,
-            "active_validation_f1": active_validation_f1,
-            "candidate_validation_f1": candidate_validation_f1,
-            "candidate_accepted": accepted,
-        }
-
     def run(self) -> tuple[list[dict], dict]:
         rows: list[dict] = []
         stream = self.config["stream"]
         training = self.config["training"]
-        labeler_type = self.config["labeler"]["type"].lower()
         previous_feature_drift = False
 
         for index, window in enumerate(self.dataset.windows(int(stream["window_size"])), start=1):
             stream_features, injected_drift = self.drift_injector.apply(window.features, index)
             feature_drift = self.drift_detector.update(stream_features)
-            neural_impact = map_drift_to_neural_impact(
-                self.model,
+            drift_signature = build_drift_signature(
+                list(self.config["dataset"]["feature_names"]),
+                self.drift_detector.reference_counts,
+                stream_features,
+                self.drift_detector.range_min,
+                self.drift_detector.range_max,
                 feature_drift["feature_drift_scores"],
-                self.impact_threshold,
-            )
-            injection_validation = self.drift_injector.validate(
-                index,
-                injected_drift,
-                feature_drift["drifted_feature_indices"],
-                neural_impact["impact_selected_modules"],
+                normalized_shift_clip=self.signature_shift_clip,
             )
             student_labels = self._predict(self.model, stream_features)
             static_labels = self._predict(self.static_model, stream_features)
+            student_f1 = macro_f1(window.labels, student_labels)
+            static_f1 = macro_f1(window.labels, static_labels)
             balanced = bool(training.get("balance_binary", self.config["dataset"]["num_classes"] == 2))
             labeling_metrics = self._empty_labeling_metrics()
             selected_indices = torch.empty(0, dtype=torch.long, device=self.device)
             proxy_f1 = float("nan")
             static_proxy_f1 = float("nan")
             labeler_f1 = float("nan")
-            trusted_x = stream_features[:0]
             trusted_y = window.labels[:0]
             trusted_indices = selected_indices
             adaptation = {"adaptation_event": False}
+            validation_modules: list[str] = []
+            conditioned_metrics = {
+                "adapter_prediction_attempted": False,
+                "adapter_prediction_latency": 0.0,
+                "adapter_confidence": None,
+                "adapter_confidence_threshold": self.adapter_confidence_threshold,
+                "adapter_confidence_passed": None,
+                "adapter_module_probabilities": {},
+                "predicted_modules": [],
+                "predicted_module_magnitudes": {},
+                "selected_repair_prototypes": {},
+                "selected_classifier_repair_prototype": None,
+                "predicted_repair_parameter_count": 0,
+                "predicted_repair_update_bytes": 0,
+                "model_f1_before_drift": self.last_non_drift_f1,
+                "f1_after_drift": None,
+                "f1_after_predicted_repair": None,
+                "adaptation_latency": 0.0,
+                "repair_affected_modules": [],
+                "repair_module_magnitudes": {},
+                "repair_confidence": None,
+                "repair_changed_parameters": 0,
+                "repair_changed_parameter_percentage": 0.0,
+                "repair_update_bytes": 0,
+            }
 
-            if self.policy_mode == "baseline_caravan":
+            if self.policy_mode == "caravan":
                 labeling_started = time.perf_counter()
                 produced = self.labeler.label(
                     stream_features, window.raw_features, window.generated_labels,
                 )
                 labeling_time = time.perf_counter() - labeling_started
-                valid = produced != ABSTAIN if labeler_type == "device_list" else torch.ones_like(
-                    produced, dtype=torch.bool,
+                valid = (
+                    produced != ABSTAIN
+                    if self.labeler_type == "device_list"
+                    else torch.ones_like(produced, dtype=torch.bool)
                 )
-                labeler_labels = window.labels[valid] if labeler_type == "device_list" else produced
+                labeler_labels = (
+                    window.labels[valid]
+                    if self.labeler_type == "device_list"
+                    else produced
+                )
                 training_features = stream_features[valid]
                 proxy_student = student_labels[valid]
                 proxy_static = static_labels[valid]
@@ -313,11 +243,13 @@ class DriftAdaptPipeline:
                     "accepted_label_count": int(valid.sum().item()),
                     "labeling_time": labeling_time,
                 })
-                trusted_x = training_features
                 trusted_y = labeler_labels
-                trusted_indices = selected_indices[valid] if labeler_type == "device_list" else selected_indices
+                trusted_indices = (
+                    selected_indices[valid]
+                    if self.labeler_type == "device_list"
+                    else selected_indices
+                )
                 if requested and train_x is not None:
-                    self.previous_model = copy.deepcopy(self.model).eval()
                     for parameter in self.model.parameters():
                         parameter.requires_grad_(True)
                     training_time, self.optimizer = retrain_model(
@@ -345,65 +277,95 @@ class DriftAdaptPipeline:
                         "candidate_validation_f1": None,
                         "candidate_accepted": True,
                     }
-            else:
+            elif self.policy_mode == "drift_conditioned":
                 drift_active = bool(feature_drift["feature_drift_detected"])
-                if drift_active and not previous_feature_drift:
-                    self.pending_features = stream_features[:0]
-                    self.pending_labels = window.labels[:0]
-                    self.pending_labeling_time = 0.0
-                    self.drift_event_handled = False
+                conditioned_metrics["f1_after_drift"] = student_f1 if drift_active else None
+                raw_feature_shift = any(
+                    score is not None and score > self.drift_detector.threshold
+                    for score in feature_drift["feature_drift_scores"].values()
+                )
+                if not raw_feature_shift:
+                    self.last_non_drift_f1 = student_f1
                 if not drift_active:
-                    if previous_feature_drift and self.replay_enabled:
-                        self.replay.add(self.pending_features, self.pending_labels)
-                    self.pending_features = stream_features[:0]
-                    self.pending_labels = window.labels[:0]
-                    self.pending_labeling_time = 0.0
                     self.drift_event_handled = False
+                elif not previous_feature_drift:
+                    self.drift_event_handled = False
+
                 if drift_active and not self.drift_event_handled:
-                    selected_indices = select_drift_associated_samples(
-                        stream_features,
-                        feature_drift["feature_drift_scores"],
-                        feature_drift["drifted_feature_indices"],
-                        self.drift_detector.range_min,
-                        self.drift_detector.range_max,
-                        enabled=self.sample_selection_enabled,
-                        max_samples=self.max_selected_samples,
+                    adaptation_started = time.perf_counter()
+                    plan, prediction = predict_repair(
+                        self.adapter_bundle,
+                        drift_signature["drift_signature_vector"],
+                        module_threshold=self.adapter_module_threshold,
+                        parameter_bits=self.parameter_bits,
                     )
-                selected_x = stream_features[selected_indices]
-                selected_raw = window.raw_features[selected_indices]
-                selected_generated = window.generated_labels[selected_indices]
-                selected_oracle = window.labels[selected_indices]
-                trusted_labels, labeling_metrics = self.trusted_labeler.label(
-                    selected_x, selected_raw, selected_generated,
-                )
-                trusted_labels, labeling_metrics = self.trusted_labeler.apply_fallback(
-                    trusted_labels, selected_oracle, labeling_metrics,
-                )
-                accepted = trusted_labels != ABSTAIN
-                trusted_x = selected_x[accepted]
-                trusted_y = trusted_labels[accepted]
-                accepted_indices = selected_indices[accepted]
-                trusted_indices = accepted_indices
-                if trusted_y.numel():
-                    labeler_f1 = macro_f1(window.labels[accepted_indices], trusted_y)
-                    proxy_f1 = macro_f1(trusted_y, student_labels[accepted_indices])
-                    static_proxy_f1 = macro_f1(trusted_y, static_labels[accepted_indices])
-                self._append_pending(trusted_x, trusted_y)
-                self.pending_labeling_time += labeling_metrics["labeling_time"]
-                impacted_modules = neural_impact["impact_selected_modules"]
-                if (
-                    drift_active
-                    and not self.drift_event_handled
-                    and impacted_modules
-                    and self.pending_labels.numel() >= self.min_labeled_samples
-                ):
-                    adaptation = self._candidate_adaptation(
-                        impacted_modules, training, balanced,
+                    conditioned_metrics.update(prediction)
+                    conditioned_metrics["adapter_prediction_attempted"] = True
+                    validation_modules = list(prediction["predicted_modules"])
+                    confidence_ok = (
+                        prediction["adapter_confidence"]
+                        >= self.adapter_confidence_threshold
                     )
+                    conditioned_metrics["adapter_confidence_passed"] = confidence_ok
+                    repaired_f1 = student_f1
+                    repair_satisfied = False
+                    if confidence_ok and plan.affected_modules:
+                        candidate, repair_metrics = apply_repair_plan(
+                            self.model, plan, parameter_bits=self.parameter_bits,
+                            anchor_model=self.repair_base_model,
+                        )
+                        if all(torch.isfinite(parameter).all() for parameter in candidate.parameters()):
+                            repair_satisfied = True
+                            conditioned_metrics.update(repair_metrics)
+                            if repair_metrics["repair_changed_parameters"] > 0:
+                                self.model = candidate.eval()
+                                self.model_version += 1
+                                total = sum(
+                                    parameter.numel() for parameter in self.model.parameters()
+                                )
+                                adaptation = {
+                                    "adaptation_event": True,
+                                    "training_sample_count": 0,
+                                    "adaptation_mode": "drift_conditioned",
+                                    "selected_modules": plan.affected_modules,
+                                    "total_parameters": total,
+                                    "trainable_parameters": repair_metrics[
+                                        "repair_changed_parameters"
+                                    ],
+                                    "parameter_update_percentage": repair_metrics[
+                                        "repair_changed_parameter_percentage"
+                                    ],
+                                    "updated_parameters": repair_metrics[
+                                        "repair_changed_parameters"
+                                    ],
+                                    "updated_parameter_percentage": repair_metrics[
+                                        "repair_changed_parameter_percentage"
+                                    ],
+                                    "estimated_parameter_update_bytes": repair_metrics[
+                                        "repair_update_bytes"
+                                    ],
+                                    "training_time": 0.0,
+                                    "candidate_validation_time": 0.0,
+                                    "active_validation_f1": None,
+                                    "candidate_validation_f1": None,
+                                    "candidate_accepted": True,
+                                }
+                    prediction_latency = time.perf_counter() - adaptation_started
+                    conditioned_metrics["adapter_prediction_latency"] = prediction_latency
                     if adaptation["adaptation_event"]:
-                        self.drift_event_handled = True
-                        if self.replay_enabled:
-                            self.replay.add(self.pending_features, self.pending_labels)
+                        conditioned_metrics["adaptation_latency"] = prediction_latency
+                        repaired_f1 = macro_f1(
+                            window.labels, self._predict(self.model, stream_features),
+                        )
+                    conditioned_metrics["f1_after_predicted_repair"] = repaired_f1
+                    self.drift_event_handled = repair_satisfied
+
+            injection_validation = self.drift_injector.validate(
+                index,
+                injected_drift,
+                feature_drift["drifted_feature_indices"],
+                validation_modules,
+            )
 
             event = bool(adaptation["adaptation_event"])
             defaults = {
@@ -429,31 +391,34 @@ class DriftAdaptPipeline:
                 if event else None
             )
             adaptation_labeling_time = (
-                labeling_metrics["labeling_time"]
-                if self.policy_mode == "baseline_caravan"
-                else self.pending_labeling_time
+                labeling_metrics["labeling_time"] if self.policy_mode == "caravan" else 0.0
             ) if event else 0.0
             total_recovery_time = (
-                adaptation_labeling_time
-                + adaptation["training_time"]
+                conditioned_metrics["adaptation_latency"]
+                if self.policy_mode == "drift_conditioned" and event else
+                adaptation_labeling_time + adaptation["training_time"]
                 + adaptation["candidate_validation_time"]
                 if event else 0.0
             )
+            conditioned_metrics["adaptation_latency"] = total_recovery_time
 
             row = {
                 "window": index,
                 "window_samples": int(stream_features.shape[0]),
-                "student_f1": macro_f1(window.labels, student_labels),
-                "static_f1": macro_f1(window.labels, static_labels),
+                "method": self.policy_mode,
+                "student_f1": student_f1,
+                "static_f1": static_f1,
                 "labeler_f1": labeler_f1,
                 "proxy_f1": proxy_f1,
                 "static_proxy_f1": static_proxy_f1,
                 "adaptation_policy": self.policy_mode,
                 "adaptation_event": event,
-                "retrained": event,
+                "retrained": event and self.policy_mode == "caravan",
                 "training_samples": adaptation["training_sample_count"],
-                "student_f1_before_adaptation": macro_f1(window.labels, student_labels) if event else None,
+                "student_f1_before_adaptation": student_f1 if event else None,
                 "student_f1_after_adaptation": after_f1,
+                "f1_before_adaptation": student_f1 if event else None,
+                "f1_after_adaptation": after_f1,
                 "samples_selected": int(selected_indices.numel()),
                 "selected_sample_indices": selected_indices.detach().cpu().tolist(),
                 "trusted_sample_indices": trusted_indices.detach().cpu().tolist(),
@@ -461,17 +426,22 @@ class DriftAdaptPipeline:
                 "adaptation_labeling_time": adaptation_labeling_time,
                 "total_adaptation_recovery_time": total_recovery_time,
                 "model_version": self.model_version,
-                "replay_buffer_size": len(self.replay) if self.replay_enabled else 0,
                 **adaptation,
                 **labeling_metrics,
                 **feature_drift,
-                **neural_impact,
+                **drift_signature,
+                **conditioned_metrics,
                 **injected_drift,
                 **injection_validation,
             }
+            row.update({
+                "teacher_samples": row["samples_sent_to_teacher"],
+                "retraining_time": row["training_time"],
+                "parameters_updated": row["updated_parameters"],
+                "parameter_update_percent": row["updated_parameter_percentage"],
+                "model_update_bytes": row["estimated_parameter_update_bytes"],
+            })
             rows.append(row)
-            if event and self.policy_mode != "baseline_caravan":
-                self.pending_labeling_time = 0.0
             previous_feature_drift = bool(feature_drift["feature_drift_detected"])
 
         summary = self._save(rows)
@@ -486,8 +456,7 @@ class DriftAdaptPipeline:
         frame = pd.DataFrame(rows)
         frame.to_csv(output / f"{dataset_name}.csv", index=False)
         events = [row for row in rows if row["adaptation_event"]]
-        accepted = [row for row in events if row["candidate_accepted"]]
-        times = [float(row["training_time"]) for row in events]
+        retraining_events = [row for row in events if row["retrained"]]
         drift_events = sum(
             bool(row["feature_drift_detected"])
             and (index == 0 or not rows[index - 1]["feature_drift_detected"])
@@ -497,51 +466,63 @@ class DriftAdaptPipeline:
             (index for index, row in enumerate(rows) if row["injected_drift_active"]),
             next((index for index, row in enumerate(rows) if row["feature_drift_detected"]), len(rows)),
         )
-        drift_window_samples = sum(
-            row["window_samples"] for row in rows if row["feature_drift_detected"]
+        average_f1 = mean([row["student_f1"] for row in rows])
+        post_drift_f1 = mean([row["student_f1"] for row in rows[drift_start:]])
+        total_teacher_samples = sum(row["teacher_samples"] for row in rows)
+        total_labeling_time = sum(float(row["labeling_time"]) for row in rows)
+        total_retraining_time = sum(float(row["retraining_time"]) for row in rows)
+        total_recovery_time = sum(
+            float(row["total_adaptation_recovery_time"]) for row in rows
         )
-        selected_drift_samples = sum(
-            row["samples_sent_to_teacher"] for row in rows if row["feature_drift_detected"]
+        average_adaptation_latency = (
+            mean([float(row["adaptation_latency"]) for row in events])
+            if events else 0.0
+        )
+        average_update_percentage = (
+            mean([float(row["parameter_update_percent"]) for row in events])
+            if events else 0.0
         )
         summary = {
             "dataset": dataset_name,
+            "method": self.policy_mode,
             "adaptation_policy": self.policy_mode,
             "number_of_windows": len(rows),
-            "number_of_retraining_events": len(events),
+            "number_of_retraining_events": len(retraining_events),
             "number_of_drift_events": drift_events,
-            "number_of_adaptation_events": len(accepted),
-            "average_student_f1": mean([row["student_f1"] for row in rows]),
-            "post_drift_student_f1": mean([row["student_f1"] for row in rows[drift_start:]]),
+            "number_of_adaptation_events": len(events),
+            "average_f1": average_f1,
+            "post_drift_f1": post_drift_f1,
+            "total_teacher_samples": total_teacher_samples,
+            "total_labeling_time": total_labeling_time,
+            "total_retraining_time": total_retraining_time,
+            "total_adaptation_recovery_time": total_recovery_time,
+            "average_adaptation_latency": average_adaptation_latency,
+            "total_updated_parameters": sum(row["parameters_updated"] for row in events),
+            "average_parameter_update_percentage": average_update_percentage,
+            "total_model_update_bytes": sum(row["model_update_bytes"] for row in events),
+            # Compatibility aliases retained for existing result consumers.
+            "average_student_f1": average_f1,
+            "post_drift_student_f1": post_drift_f1,
             "average_static_f1": mean([row["static_f1"] for row in rows]),
             "average_labeler_f1": mean([row["labeler_f1"] for row in rows]),
-            "total_retraining_time": sum(times),
-            "average_retraining_time": mean(times),
-            "total_updated_parameters": sum(row["updated_parameters"] for row in accepted),
-            "total_model_update_bytes": sum(
-                row["estimated_parameter_update_bytes"] for row in accepted
+            "average_retraining_time": (
+                mean([float(row["retraining_time"]) for row in retraining_events])
+                if retraining_events else 0.0
             ),
-            "average_parameter_update_percentage": mean([
-                row["updated_parameter_percentage"] for row in accepted
-            ]),
-            "labeling_reduction": (
-                1.0 - selected_drift_samples / drift_window_samples
-                if drift_window_samples else 0.0
-            ),
-            "candidate_rejection_count": sum(
-                row["candidate_accepted"] is False for row in events
-            ),
-            "replay_buffer_size": len(self.replay) if self.replay_enabled else 0,
             "number_of_feature_drift_windows": sum(
                 bool(row["feature_drift_detected"]) for row in rows
             ),
             "histogram_counter_count": self.drift_detector.histogram_counter_count,
             "histogram_counter_bits": COUNTER_BITS,
             "histogram_state_bytes": self.drift_detector.state_bytes,
-            "impact_state_elements": rows[0]["impact_state_elements"] if rows else 0,
-            "impact_multiply_accumulate_count": (
-                rows[0]["impact_multiply_accumulate_count"] if rows else 0
-            ),
             "injected_drift_events": self.drift_injector.event_summaries(),
+            "average_adapter_confidence": mean([
+                row["adapter_confidence"] for row in rows
+                if row["adapter_confidence"] is not None
+            ]),
+            "total_drift_conditioned_adaptation_latency": (
+                total_recovery_time if self.policy_mode == "drift_conditioned" else 0.0
+            ),
         }
         with (output / f"{dataset_name}.json").open("w", encoding="utf-8") as handle:
             json.dump({"summary": summary, "windows": rows}, handle, indent=2, allow_nan=True)

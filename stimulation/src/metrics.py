@@ -15,4 +15,7 @@ def macro_f1(expected: torch.Tensor, predicted: torch.Tensor) -> float:
 
 
 def mean(values: list[float]) -> float:
-    return float(np.nanmean(values)) if values else float("nan")
+    if not values:
+        return float("nan")
+    array = np.asarray(values, dtype=float)
+    return float("nan") if np.isnan(array).all() else float(np.nanmean(array))
