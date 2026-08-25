@@ -73,7 +73,7 @@ module driftadapt_control_regs #(
     input  wire [31:0]   update_new_version_axis
 );
     localparam [31:0] FEATURE_WORD = 32'h44524654; // "DRFT"
-    localparam [31:0] VERSION_WORD = 32'h00040001; // online-window ABI v4.1
+    localparam [31:0] VERSION_WORD = 32'h00040002; // online-window ABI v4.2
     localparam [31:0] BENCHMARK_MODE = 32'h00000002; // hybrid control plane
     localparam [31:0] FEATURE_BYTES = 32'd32; // sixteen signed Q8.8 values
     localparam [31:0] FRAME_BYTES = 32'd60;

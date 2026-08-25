@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read DRIFTADAPT online-window progress, proxy quality, and performance over JTAG."""
+"""Read CARAVAN/DriftAdapt online-window progress and performance over JTAG."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ import sys
 
 
 FEATURE_WORD = 0x44524654
-FORMAT_VERSION = 0x00040001
+FORMAT_VERSION = 0x00040002
 RAW_PATTERN = re.compile(r"^DRIFTADAPT_JTAG_([A-Z0-9_]+)=0x([0-9a-fA-F]+)$", re.MULTILINE)
 U64_NAMES = (
     "captured", "labeled", "classified", "elapsed", "busy", "input_stall",
     "output_stall", "latency_sum", "latency_min", "latency_max", "sent",
-    "total_cycles", "closed_loop",
+    "total_cycles", "closed_loop", "released",
 )
 
 
@@ -52,7 +52,8 @@ def run_jtag_reader(args: argparse.Namespace, control_script: Path) -> dict[str,
         "FEATURE", "STATUS", "VERSION", "DATASET_COUNT", "CLOCK_HZ", "MODE",
         "WINDOW_SIZE", "READY_MASK", "LAST_WINDOW_ID", "LAST_WINDOW_COUNT",
         "LAST_TP", "LAST_TN", "LAST_FP", "LAST_FN", "LAST_MATCHES",
-        "WINDOWS_LABELED", "MODEL_VERSION", "WEIGHTS_STAGED", "WEIGHT_STATUS",
+        "WINDOWS_LABELED", "WINDOWS_RELEASED", "LAST_RELEASED_WINDOW_ID",
+        "LAST_RELEASED_COUNT", "MODEL_VERSION", "WEIGHTS_STAGED", "WEIGHT_STATUS",
     }
     required.update(f"{name.upper()}_{half}" for name in U64_NAMES for half in ("LO", "HI"))
     missing = sorted(required - raw.keys())
@@ -61,7 +62,9 @@ def run_jtag_reader(args: argparse.Namespace, control_script: Path) -> dict[str,
     return raw
 
 
-def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str], bool]:
+def calculate_report(
+    raw: dict[str, int],
+) -> tuple[dict[str, int | float | str | None], bool]:
     if raw["FEATURE"] != FEATURE_WORD:
         raise RuntimeError(f"DRIFTADAPT feature word mismatch: 0x{raw['FEATURE']:08x}")
     if raw["VERSION"] != FORMAT_VERSION:
@@ -86,10 +89,16 @@ def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str],
     mean_latency_cycles = divide(counters["latency_sum"], classified)
     online_complete = bool(raw["STATUS"] & (1 << 3))
 
-    report: dict[str, int | float | str] = {
+    if counters["labeled"] and not counters["released"]:
+        runtime_method = "caravan"
+    elif counters["released"] and not counters["labeled"]:
+        runtime_method = "drift_conditioned"
+    else:
+        runtime_method = "unknown_or_mixed"
+    report: dict[str, int | float | str | None] = {
         "status": raw["STATUS"],
         "register_version": raw["VERSION"],
-        "mode": "fpga_inference_local_agent",
+        "method": runtime_method,
         "generator_active": (raw["STATUS"] >> 1) & 1,
         "generator_finished": (raw["STATUS"] >> 2) & 1,
         "online_complete": int(online_complete),
@@ -102,8 +111,10 @@ def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str],
         "dataset_count": raw["DATASET_COUNT"],
         "window_size": raw["WINDOW_SIZE"],
         "windows_labeled": raw["WINDOWS_LABELED"],
+        "windows_released": raw["WINDOWS_RELEASED"],
         "captured": counters["captured"],
         "labeled": counters["labeled"],
+        "released_without_labels": counters["released"],
         "classified": classified,
         "last_window_id": raw["LAST_WINDOW_ID"],
         "last_window_count": raw["LAST_WINDOW_COUNT"],
@@ -112,7 +123,9 @@ def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str],
         "last_false_positive": fp,
         "last_false_negative": fn,
         "last_matches": raw["LAST_MATCHES"],
-        "last_proxy_macro_f1": proxy_macro_f1,
+        "last_proxy_macro_f1": proxy_macro_f1 if runtime_method == "caravan" else None,
+        "last_released_window_id": raw["LAST_RELEASED_WINDOW_ID"],
+        "last_released_count": raw["LAST_RELEASED_COUNT"],
         "model_version": raw["MODEL_VERSION"],
         "weights_staged": raw["WEIGHTS_STAGED"],
         "active_weight_bank": (raw["WEIGHT_STATUS"] >> 10) & 1,
@@ -136,8 +149,9 @@ def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str],
         online_complete
         and counters["sent"] == raw["DATASET_COUNT"]
         and counters["captured"] == raw["DATASET_COUNT"]
-        and counters["labeled"] == raw["DATASET_COUNT"]
+        and counters["labeled"] + counters["released"] == raw["DATASET_COUNT"]
         and classified == raw["DATASET_COUNT"]
+        and runtime_method in {"caravan", "drift_conditioned"}
         and not report["label_error"]
         and not report["weight_commit_pending"]
     )
@@ -145,7 +159,7 @@ def calculate_report(raw: dict[str, int]) -> tuple[dict[str, int | float | str],
     return report, passed
 
 
-def print_report(report: dict[str, int | float | str]) -> None:
+def print_report(report: dict[str, int | float | str | None]) -> None:
     for name, value in report.items():
         if name in {"status", "register_version"}:
             print(f"{name}=0x{int(value):08x}")

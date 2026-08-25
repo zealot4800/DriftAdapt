@@ -4,11 +4,9 @@
 //
 // The feature-only source ROM contains no evaluation label. This block records
 // those features and the data-plane model's
-// prediction in one of two windows.  A control-plane labeling agent reads a
-// complete window through AXI-Lite, writes one generated label per sample, and
-// submits the bank.  The FPGA then builds the proxy confusion matrix.  The
-// control plane uses those counters to calculate macro F1 and decide whether
-// retraining is required.
+// prediction in one of two windows. CARAVAN supplies labels and uses the proxy
+// confusion matrix; drift-conditioned execution reads feature statistics and
+// releases each bank without labels. Both methods share model-update hardware.
 module driftadapt_window_manager #(
     parameter integer DATASET_COUNT = 16000,
     parameter integer WINDOW_SIZE = 100,
@@ -96,7 +94,7 @@ module driftadapt_window_manager #(
     input  wire          s_axil_rready
 );
     localparam [31:0] FEATURE_WORD = 32'h44524654; // "DRFT"
-    localparam [31:0] VERSION_WORD = 32'h00040001; // online-window ABI v4.1
+    localparam [31:0] VERSION_WORD = 32'h00040002; // online-window ABI v4.2
     localparam [31:0] ONLINE_MODE = 32'd2;
     localparam integer WINDOW_INDEX_WIDTH = $clog2(WINDOW_SIZE + 1);
     localparam integer LABEL_WORDS = (WINDOW_SIZE + 31) / 32;
@@ -165,6 +163,10 @@ module driftadapt_window_manager #(
     reg [31:0] last_model_version;
     reg [31:0] windows_labeled;
     reg [63:0] total_labeled;
+    reg [31:0] windows_released;
+    reg [31:0] last_released_window_id;
+    reg [31:0] last_released_count;
+    reg [63:0] total_released;
 
     reg [PARAM_COUNT-1:0] weight_stage_mask;
     reg [7:0] weight_stage_count;
@@ -242,8 +244,10 @@ module driftadapt_window_manager #(
     wire current_tn = !score_label && !score_prediction;
     wire current_fp = !score_label && score_prediction;
     wire current_fn = score_label && !score_prediction;
+    // CARAVAN consumes windows through labeled scoring. Drift-conditioned
+    // execution consumes them through the label-free release command.
     wire online_complete = generator_finished_axis &&
-                           total_labeled == DATASET_COUNT &&
+                           (total_labeled + total_released) == DATASET_COUNT &&
                            !bank0_ready && !bank1_ready && !scoring;
     assign online_complete_axis = online_complete;
     assign total_captured_axis = total_captured;
@@ -373,6 +377,11 @@ module driftadapt_window_manager #(
                 32'h00000144: read_register = update_old_version_axis;
                 32'h00000148: read_register = update_new_version_axis;
                 32'h0000014c: read_register = model_version_axis;
+                32'h00000150: read_register = windows_released;
+                32'h00000154: read_register = last_released_window_id;
+                32'h00000158: read_register = last_released_count;
+                32'h0000015c: read_register = total_released[31:0];
+                32'h00000160: read_register = total_released[63:32];
                 32'h0000010c: read_register = {
                     model_version_axis[15:0], 5'd0, active_weight_bank_axis,
                     weight_commit_request_axis, (&weight_stage_mask),
@@ -490,6 +499,10 @@ module driftadapt_window_manager #(
             last_model_version <= 0;
             windows_labeled <= 0;
             total_labeled <= 0;
+            windows_released <= 0;
+            last_released_window_id <= 0;
+            last_released_count <= 0;
+            total_released <= 0;
             weight_stage_mask <= 0;
             weight_stage_count <= 0;
             weight_stage_valid_axis <= 1'b0;
@@ -564,7 +577,7 @@ module driftadapt_window_manager #(
 
             // sent_packets_axis changes on the first source-to-DNN transfer.
             // It is observed one edge later, so seed with two cycles to retain
-            // an inclusive first-input-to-final-label measurement.
+            // an inclusive first-input-to-final-window-consumption measurement.
             if (!closed_loop_started && sent_packets_axis != 0) begin
                 closed_loop_started <= 1'b1;
                 closed_loop_cycles <= 64'd2;
@@ -699,6 +712,30 @@ module driftadapt_window_manager #(
                             label_error <= 1'b0;
                         end else begin
                             label_error <= 1'b1;
+                        end
+                    end else if (wdata_pending[2] && bank0_ready && !scoring) begin
+                        if (submit_window_id != bank0_window_id) begin
+                            label_error <= 1'b1;
+                        end else begin
+                            windows_released <= windows_released + 1'b1;
+                            last_released_window_id <= bank0_window_id;
+                            last_released_count <= bank0_count;
+                            total_released <= total_released + bank0_count;
+                            bank0_ready <= 1'b0;
+                            agent_valid_bits0 <= 0;
+                            label_error <= 1'b0;
+                        end
+                    end else if (wdata_pending[3] && bank1_ready && !scoring) begin
+                        if (submit_window_id != bank1_window_id) begin
+                            label_error <= 1'b1;
+                        end else begin
+                            windows_released <= windows_released + 1'b1;
+                            last_released_window_id <= bank1_window_id;
+                            last_released_count <= bank1_count;
+                            total_released <= total_released + bank1_count;
+                            bank1_ready <= 1'b0;
+                            agent_valid_bits1 <= 0;
+                            label_error <= 1'b0;
                         end
                     end
                 end else if (awaddr_pending == 32'h00000104 && wdata_pending[0]) begin

@@ -4,6 +4,7 @@
 #   status [wait-seconds]
 #   snapshot <auto|0|1>
 #   submit <bank> <window-id> <comma-separated-label-words> <comma-separated-valid-words>
+#   release <bank> <window-id>
 #   weights <182-line-hex-memory-file>
 #   selective <index,hex-value patch file>
 
@@ -93,6 +94,8 @@ proc driftadapt_emit_status {hw_axis} {
         HIST_CONFIG 0x0e4 HIST_SELECTOR 0x0e8 HIST_STATE_BYTES 0x0fc
         WEIGHT_STATUS 0x10c UPDATE_STATUS 0x118 UPDATE_PATCHED 0x11c
         UPDATE_BYTES 0x120 UPDATE_OLD_VERSION 0x144 UPDATE_NEW_VERSION 0x148
+        WINDOWS_RELEASED 0x150 LAST_RELEASED_WINDOW_ID 0x154
+        LAST_RELEASED_COUNT 0x158 RELEASED_LO 0x15c RELEASED_HI 0x160
     }
     foreach {name address} $registers {
         set value [driftadapt_read_word $hw_axis $address $name]
@@ -172,7 +175,7 @@ if {$driftadapt_axis eq ""} { error "private DRIFTADAPT JTAG AXI master was not 
 set feature [driftadapt_read_integer $driftadapt_axis 0x000 feature]
 set version [driftadapt_read_integer $driftadapt_axis 0x008 version]
 if {$feature != 0x44524654} { error "DRIFTADAPT feature word mismatch" }
-if {$version != 0x00040001} { error "DRIFTADAPT online-window ABI mismatch" }
+if {$version != 0x00040002} { error "DRIFTADAPT online-window ABI mismatch" }
 
 if {$operation eq "status"} {
     set wait_seconds [lindex $argv 2]
@@ -253,6 +256,48 @@ if {$operation eq "status"} {
         puts "DRIFTADAPT_WINDOW_RECORD=$sample,[join $fields ,]"
     }
     driftadapt_emit_histogram $driftadapt_axis $window_id $sample_count
+} elseif {$operation eq "release"} {
+    set bank [lindex $argv 2]
+    set window_id [lindex $argv 3]
+    if {$bank ni {0 1}} { error "release bank must be 0 or 1" }
+    if {![string is integer -strict $window_id] || $window_id < 0} {
+        error "release window ID must be a non-negative integer"
+    }
+    set ready_mask [driftadapt_read_integer $driftadapt_axis 0x020 release_ready]
+    if {(($ready_mask >> $bank) & 1) == 0} {
+        error "requested DRIFTADAPT release bank is not ready"
+    }
+    if {$bank == 0} {
+        set id_address 0x024
+        set count_address 0x028
+    } else {
+        set id_address 0x030
+        set count_address 0x034
+    }
+    set bank_window_id [driftadapt_read_integer $driftadapt_axis $id_address release_window_id]
+    set sample_count [driftadapt_read_integer $driftadapt_axis $count_address release_count]
+    if {$bank_window_id != $window_id} {
+        error "release window ID does not match ready bank"
+    }
+    set released_before [driftadapt_read_integer $driftadapt_axis 0x150 released_before]
+    driftadapt_write_word $driftadapt_axis 0x114 $window_id release_window_id
+    driftadapt_write_word $driftadapt_axis 0x100 [expr {1 << ($bank + 2)}] release
+    set deadline [expr {[clock milliseconds] + 5000}]
+    while {1} {
+        set released_now [driftadapt_read_integer $driftadapt_axis 0x150 released_now]
+        set released_window [driftadapt_read_integer $driftadapt_axis 0x154 released_window]
+        set release_status [driftadapt_read_integer $driftadapt_axis 0x004 release_status]
+        if {($release_status & 0x80) != 0} {
+            error "FPGA rejected label-free release for window $window_id"
+        }
+        if {$released_now > $released_before && $released_window == $window_id} { break }
+        if {[clock milliseconds] >= $deadline} { error "timed out releasing DRIFTADAPT window" }
+        after 10
+    }
+    set released_count [driftadapt_read_integer $driftadapt_axis 0x158 released_count]
+    puts "DRIFTADAPT_RELEASE_BANK=$bank"
+    puts "DRIFTADAPT_RELEASE_WINDOW_ID=$window_id"
+    puts "DRIFTADAPT_RELEASE_COUNT=$released_count"
 } elseif {$operation eq "submit"} {
     set bank [lindex $argv 2]
     set window_id [lindex $argv 3]

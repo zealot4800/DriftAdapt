@@ -213,7 +213,7 @@ module driftadapt_u55c_250mhz #(
         .latency_max_cycles_axis(latency_max_cycles)
     );
 
-    // Private JTAG AXI-Lite master used by the local labeling agent. The
+    // Private JTAG AXI-Lite master used by the host controller. The
     // interface does not enumerate PCIe and is outside the measured stream.
     wire [31:0] jtag_awaddr;
     wire [2:0] jtag_awprot;

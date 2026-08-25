@@ -14,8 +14,8 @@ usage() {
 Usage: $(basename "$0") [--bitstream FILE] [--yes] [--dry-run]
 
 Programs the DRIFTADAPT online-window image over JTAG. Traffic inference and
-window capture run in FPGA fabric; a local labeling agent later exchanges
-windows through private JTAG AXI. This command does not load a driver,
+window capture run in FPGA fabric; the host exchanges either CARAVAN labels or
+label-free DriftAdapt statistics through private JTAG AXI. This command does not load a driver,
 configure QDMA/CMAC, create Linux interfaces, or use an optical cable.
 EOF
 }
@@ -77,7 +77,7 @@ bitstream=$(readlink -f "$bitstream")
 echo "Bitstream: $bitstream"
 echo "SHA-256:   $(sha256sum "$bitstream" | awk '{print $1}')"
 echo "Reports:   $report_dir"
-echo "Mode:      FPGA inference with local-agent labeling windows"
+echo "Mode:      FPGA inference with CARAVAN/DriftAdapt window exchange"
 
 if ((dry_run)); then
     echo "DRIFTADAPT_U55C_ONLINE_DRY_RUN=PASS"
@@ -99,5 +99,5 @@ env -u LD_LIBRARY_PATH -u PYTHONPATH \
 
 echo
 echo "DRIFTADAPT_U55C_ONLINE_PROGRAM=PASS"
-echo "The FPGA now fills two labeling windows and waits for the local agent."
-echo "Run hardware/u55c/scripts/run_online_adaptation.py to label, detect drift, and adapt."
+echo "The FPGA now fills two windows and waits for the host controller."
+echo "Run hardware/u55c/scripts/run_online_adaptation.py in caravan or drift_conditioned mode."

@@ -62,7 +62,7 @@ module driftadapt_packet_generator #(
                 sample_word[feature_index*16 +: 8];
         end
         // Byte 46 was used by the old in-FPGA oracle checker. Keep it zero so
-        // the local labeling agent is the only online reference source.
+        // CARAVAN's host labeler is the only online reference source.
         packet_data[46*8 +: 8] = 8'd0;
         packet_data[47*8 +: 8] = 8'd0;
         packet_data[48*8 +: 8] = 8'hff;
