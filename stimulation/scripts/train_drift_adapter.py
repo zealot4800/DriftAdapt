@@ -15,7 +15,11 @@ def main() -> None:
     sys.path.insert(0, str(stimulation_root))
     from src.adapter import evaluate_adapter, save_adapter_bundle, train_drift_adapter
     from src.data import resolve_path
-    from src.drift_dataset import analyze_drift_repair_learnability, load_drift_repair_dataset
+    from src.drift_dataset import (
+        analyze_drift_repair_learnability,
+        load_drift_repair_dataset,
+        resolve_feature_reconfiguration_config,
+    )
     from src.drift_signature import DRIFT_SIGNATURE_FORMAT_VERSION, SIGNATURE_FIELDS
     from src.models import build_model, load_checkpoint
     from src.repair import model_fingerprint
@@ -60,6 +64,10 @@ def main() -> None:
     )
     expected_signature_config = {
         "bins": int(config.get("drift", {}).get("bins", 16)),
+        "threshold": float(config.get("drift", {}).get("threshold", 0.10)),
+        "consecutive_windows": int(
+            config.get("drift", {}).get("consecutive_windows", 3)
+        ),
         "reference_windows": int(config.get("drift", {}).get("reference_windows", 10)),
         "normalized_shift_clip": float(
             config.get("drift_conditioned", {}).get("signature_shift_clip", 8.0)
@@ -69,6 +77,14 @@ def main() -> None:
         raise ValueError("Drift-repair dataset was generated for different model weights")
     if artifact["feature_names"] != list(config["dataset"]["feature_names"]):
         raise ValueError("Drift-repair dataset feature ordering does not match the config")
+    expected_feature_config = resolve_feature_reconfiguration_config(
+        config.get("feature_reconfiguration"),
+        len(config["dataset"]["feature_names"]),
+    )
+    if artifact["feature_reconfiguration_config"] != expected_feature_config:
+        raise ValueError(
+            "Drift-repair dataset feature-reconfiguration settings do not match the config"
+        )
     if artifact["signature_config"] != expected_signature_config:
         raise ValueError("Drift-repair dataset signature settings do not match the config")
     if (

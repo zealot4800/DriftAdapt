@@ -65,6 +65,7 @@ def main() -> None:
         signature_shift_clip=float(
             config.get("drift_conditioned", {}).get("signature_shift_clip", 8.0)
         ),
+        feature_reconfiguration_config=config.get("feature_reconfiguration"),
     )
     output = args.output or stimulation_root / "results" / (
         f"{dataset_config['name']}-drift-repair.pt"

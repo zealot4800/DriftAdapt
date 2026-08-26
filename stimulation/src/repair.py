@@ -18,6 +18,28 @@ class RepairPlan:
     update_bytes: int = 0
     classifier_name: str | None = None
     classifier_delta: torch.Tensor | None = None
+    feature_mask: list[int] | None = None
+
+
+def apply_feature_mask(
+    features: torch.Tensor,
+    feature_mask: list[int] | torch.Tensor,
+    reference_values: list[float] | torch.Tensor,
+) -> torch.Tensor:
+    """Replace inactive inputs with fixed values without changing tensor shape."""
+    if features.ndim != 2:
+        raise ValueError("Feature masking expects a two-dimensional input tensor")
+    mask = torch.as_tensor(feature_mask, device=features.device).flatten()
+    reference = torch.as_tensor(
+        reference_values, device=features.device, dtype=features.dtype,
+    ).flatten()
+    if mask.numel() != features.shape[1] or reference.numel() != features.shape[1]:
+        raise ValueError("Feature mask and reference values must match the input width")
+    if not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError("Feature mask values must be binary")
+    if not torch.isfinite(reference).all():
+        raise ValueError("Feature masking reference values must be finite")
+    return torch.where(mask.to(torch.bool)[None, :], features, reference[None, :])
 
 
 def _module_vector(module: nn.Module) -> torch.Tensor:
@@ -102,6 +124,7 @@ def apply_repair_plan(
     *,
     parameter_bits: int = 32,
     anchor_model: nn.Module | None = None,
+    feature_mask: list[int] | torch.Tensor | None = None,
 ) -> tuple[nn.Module, dict]:
     """Apply base-relative module deltas to a copied candidate model.
 
@@ -111,6 +134,12 @@ def apply_repair_plan(
     """
     if parameter_bits < 1:
         raise ValueError("parameter_bits must be positive")
+    if plan.feature_mask is not None:
+        if feature_mask is None:
+            raise ValueError("A masked repair plan requires its active feature mask")
+        active_mask = torch.as_tensor(feature_mask).flatten().tolist()
+        if active_mask != list(plan.feature_mask):
+            raise ValueError("Repair plan is incompatible with the active feature mask")
     if anchor_model is not None:
         model_state = model.state_dict()
         anchor_state = anchor_model.state_dict()

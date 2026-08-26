@@ -111,8 +111,9 @@ The old `baseline_caravan` spelling is accepted as a deprecated alias for
 feature-only histogram/JSD drift
   -> 5-value signature per feature
   -> small drift adapter
-  -> predicted hidden modules, magnitudes, and confidence
-  -> nearest learned oracle-repair prototype per predicted module
+  -> predicted hidden modules, magnitudes, feature mask, and confidence
+  -> exact-mask-compatible oracle-repair prototypes
+  -> replace inactive inputs with frozen reference means
   -> matching small final-classifier repair
   -> repair a copied candidate model
   -> deploy only above the configured confidence threshold
@@ -122,11 +123,13 @@ Each feature contributes JSD, normalized mean shift, normalized standard-
 deviation shift, normalized median shift, and mean-shift direction. Runtime
 signature generation accepts feature and histogram state only; it has no label
 input and does not construct or call the teacher. The adapter is not a full-weight
-hypernetwork. It predicts hidden-module selection and normalized magnitude and
-scales the closest offline parameter-delta prototype for each selected module.
-The repair also carries the matching final-classifier delta. This is required
-because a hidden-only repair cannot reproduce an oracle whose classifier was
-adapted, while keeping the adapter output module-oriented and explicit.
+hypernetwork. Its added feature head chooses among feature configurations that
+have compatible offline repairs, never changes the MLP input width, and never
+exceeds the configured active-feature budget. Inactive values are replaced by
+the processed-space mean of the frozen reference windows stored in the adapter
+checkpoint. The adapter scales the closest same-mask parameter-delta prototype
+for each selected module. The repair also carries the same-scenario,
+same-mask final-classifier delta.
 
 Ground-truth labels produce oracle repair targets in the offline workflow and
 calculate simulation evaluation metrics. They are never part of the drift
@@ -139,8 +142,9 @@ offline dataset. Runtime therefore rebuilds each candidate from that checkpoint
 and resolves selected parameters as `checkpoint + delta`, rather than retaining
 stale repairs or accumulating deltas across drift episodes. Adapter
 checkpoints include and validate the exact model fingerprint,
-feature order, histogram width/reference length, signature clip, parameter
-schema, and scientific-validation status before use.
+feature order, histogram width/threshold/reference length/persistence,
+signature clip, parameter schema, default mask, feature budget, masking
+reference values, prototype masks, and scientific-validation status before use.
 
 ### Offline drift-conditioned workflow
 
@@ -149,7 +153,11 @@ single-feature scenarios form the training split; the highest severity and all
 feature combinations are held out for scientific evaluation. Feature pairs are
 selected with balanced feature coverage. Oracle optimization uses the first
 post-reference traffic window, while every oracle and predicted repair is
-scored on the next disjoint traffic window.
+scored on the next disjoint traffic window. Each scenario first produces the
+existing default-mask weight-only oracle. A deterministic, drift-informed set
+of at most `max_candidate_masks` then tests feature masks with a fresh copy of
+the same weight oracle. The feature target remains the default unless the best
+feature+weight result improves macro F1 by at least `minimum_oracle_gain`.
 
 ```bash
 cd stimulation
@@ -174,8 +182,9 @@ Train the adapter and produce the learnability/generalization report:
 ```
 
 The report contains drift-signature similarity, oracle-repair similarity,
-their correlation, module-prediction accuracy, recovery ratio, and separate
-held-out results for unseen severities and feature combinations. Meaningful
+feature gain/reconfiguration rate, module and feature-mask prediction accuracy,
+recovery ratio, and separate held-out results for unseen severities and feature
+combinations. Meaningful
 held-out recovery should be demonstrated before changing the hardware testbed.
 The report's `scientific_validation_passed` gate defaults to requiring at least
 `0.30` pooled held-out signature/repair similarity correlation, `0.70`
@@ -204,7 +213,26 @@ drift_conditioned:
   confidence_threshold: 0.50
   module_threshold: 0.50
   signature_shift_clip: 8.0
+
+feature_reconfiguration:
+  enabled: true
+  active_feature_budget: 16
+  minimum_oracle_gain: 0.02
+  max_candidate_masks: 32
 ```
+
+`default_feature_mask` may optionally provide one binary value per already
+configured dataset feature; otherwise all configured features are active. The
+budget must cover that default mask. Candidate generation can disable up to two
+strongly drifted active features and, when the default has inactive features,
+also considers bounded activations and equal-cardinality swaps. It never creates
+new feature computations. Dataset and adapter formats changed for this feature,
+so older drift-repair artifacts and adapter checkpoints must be regenerated.
+
+Runtime rows retain the existing metrics and add only
+`predicted_feature_mask`, `active_feature_names`,
+`number_of_active_features`, `feature_reconfiguration_event`,
+`features_enabled`, and `features_disabled`.
 
 Confidence below the threshold leaves the model unchanged; it does not invoke
 the teacher or gradient retraining as an implicit fallback. Oracle retraining

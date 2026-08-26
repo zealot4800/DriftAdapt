@@ -11,12 +11,13 @@ import torch
 from .adapter import load_adapter_bundle, predict_repair
 from .data import StreamingDataset, resolve_path
 from .drift import COUNTER_BITS, FeatureHistogramDriftDetector
+from .drift_dataset import resolve_feature_reconfiguration_config
 from .drift_injector import TrafficDriftInjector
 from .drift_signature import build_drift_signature
 from .labelers import ABSTAIN, build_labeler
 from .metrics import macro_f1, mean
 from .models import build_model, load_checkpoint
-from .repair import apply_repair_plan
+from .repair import apply_feature_mask, apply_repair_plan
 from .trainer import form_training_set, retrain_model
 from .trigger import RetrainingTrigger
 
@@ -100,6 +101,10 @@ class DriftAdaptPipeline:
 
         conditioned = config.get("drift_conditioned", {})
         self.adapter_bundle = None
+        self.default_feature_mask: list[int] | None = None
+        self.active_feature_mask: list[int] | None = None
+        self.feature_reference_values: torch.Tensor | None = None
+        self.feature_reconfiguration_config: dict | None = None
         self.adapter_confidence_threshold = float(conditioned.get("confidence_threshold", 0.50))
         self.adapter_module_threshold = float(conditioned.get("module_threshold", 0.50))
         self.signature_shift_clip = float(conditioned.get("signature_shift_clip", 8.0))
@@ -110,6 +115,10 @@ class DriftAdaptPipeline:
         if self.signature_shift_clip <= 0:
             raise ValueError("drift_conditioned.signature_shift_clip must be positive")
         if self.policy_mode == "drift_conditioned":
+            self.feature_reconfiguration_config = resolve_feature_reconfiguration_config(
+                config.get("feature_reconfiguration"),
+                len(dataset_config["feature_names"]),
+            )
             checkpoint_value = conditioned.get("adapter_checkpoint")
             if not checkpoint_value:
                 raise ValueError(
@@ -120,11 +129,21 @@ class DriftAdaptPipeline:
                 feature_names=list(dataset_config["feature_names"]),
                 signature_config={
                     "bins": int(drift_config.get("bins", 16)),
+                    "threshold": float(drift_config.get("threshold", 0.10)),
+                    "consecutive_windows": int(
+                        drift_config.get("consecutive_windows", 3)
+                    ),
                     "reference_windows": int(drift_config.get("reference_windows", 10)),
                     "normalized_shift_clip": self.signature_shift_clip,
                 },
+                feature_reconfiguration_config=self.feature_reconfiguration_config,
                 confidence_threshold=self.adapter_confidence_threshold,
                 module_threshold=self.adapter_module_threshold,
+            )
+            self.default_feature_mask = list(self.adapter_bundle.default_feature_mask)
+            self.active_feature_mask = list(self.default_feature_mask)
+            self.feature_reference_values = self.adapter_bundle.feature_reference_values.to(
+                self.device
             )
         self.model_version = 0
         self.drift_event_handled = False
@@ -169,8 +188,20 @@ class DriftAdaptPipeline:
                 feature_drift["feature_drift_scores"],
                 normalized_shift_clip=self.signature_shift_clip,
             )
-            student_labels = self._predict(self.model, stream_features)
-            static_labels = self._predict(self.static_model, stream_features)
+            if self.policy_mode == "drift_conditioned":
+                student_features = apply_feature_mask(
+                    stream_features, self.active_feature_mask,
+                    self.feature_reference_values,
+                )
+                static_features = apply_feature_mask(
+                    stream_features, self.default_feature_mask,
+                    self.feature_reference_values,
+                )
+            else:
+                student_features = stream_features
+                static_features = stream_features
+            student_labels = self._predict(self.model, student_features)
+            static_labels = self._predict(self.static_model, static_features)
             student_f1 = macro_f1(window.labels, student_labels)
             static_f1 = macro_f1(window.labels, static_labels)
             balanced = bool(training.get("balance_binary", self.config["dataset"]["num_classes"] == 2))
@@ -192,6 +223,18 @@ class DriftAdaptPipeline:
                 "adapter_module_probabilities": {},
                 "predicted_modules": [],
                 "predicted_module_magnitudes": {},
+                "predicted_feature_mask": [],
+                "active_feature_names": (
+                    list(self.config["dataset"]["feature_names"])
+                    if self.policy_mode == "caravan" else []
+                ),
+                "number_of_active_features": (
+                    len(self.config["dataset"]["feature_names"])
+                    if self.policy_mode == "caravan" else 0
+                ),
+                "feature_reconfiguration_event": False,
+                "features_enabled": [],
+                "features_disabled": [],
                 "selected_repair_prototypes": {},
                 "selected_classifier_repair_prototype": None,
                 "predicted_repair_parameter_count": 0,
@@ -309,16 +352,43 @@ class DriftAdaptPipeline:
                     conditioned_metrics["adapter_confidence_passed"] = confidence_ok
                     repaired_f1 = student_f1
                     repair_satisfied = False
-                    if confidence_ok and plan.affected_modules:
+                    if confidence_ok:
+                        previous_mask = list(self.active_feature_mask)
+                        candidate_mask = list(plan.feature_mask or self.default_feature_mask)
                         candidate, repair_metrics = apply_repair_plan(
                             self.model, plan, parameter_bits=self.parameter_bits,
                             anchor_model=self.repair_base_model,
+                            feature_mask=candidate_mask,
                         )
                         if all(torch.isfinite(parameter).all() for parameter in candidate.parameters()):
                             repair_satisfied = True
                             conditioned_metrics.update(repair_metrics)
-                            if repair_metrics["repair_changed_parameters"] > 0:
-                                self.model = candidate.eval()
+                            mask_changed = candidate_mask != previous_mask
+                            weights_changed = repair_metrics["repair_changed_parameters"] > 0
+                            self.model = candidate.eval()
+                            self.active_feature_mask = candidate_mask
+                            student_features = apply_feature_mask(
+                                stream_features, self.active_feature_mask,
+                                self.feature_reference_values,
+                            )
+                            conditioned_metrics.update({
+                                "feature_reconfiguration_event": mask_changed,
+                                "features_enabled": [
+                                    self.config["dataset"]["feature_names"][feature_index]
+                                    for feature_index, (before, after) in enumerate(zip(
+                                        previous_mask, candidate_mask,
+                                    ))
+                                    if not before and after
+                                ],
+                                "features_disabled": [
+                                    self.config["dataset"]["feature_names"][feature_index]
+                                    for feature_index, (before, after) in enumerate(zip(
+                                        previous_mask, candidate_mask,
+                                    ))
+                                    if before and not after
+                                ],
+                            })
+                            if weights_changed or mask_changed:
                                 self.model_version += 1
                                 total = sum(
                                     parameter.numel() for parameter in self.model.parameters()
@@ -355,10 +425,21 @@ class DriftAdaptPipeline:
                     if adaptation["adaptation_event"]:
                         conditioned_metrics["adaptation_latency"] = prediction_latency
                         repaired_f1 = macro_f1(
-                            window.labels, self._predict(self.model, stream_features),
+                            window.labels, self._predict(self.model, student_features),
                         )
                     conditioned_metrics["f1_after_predicted_repair"] = repaired_f1
                     self.drift_event_handled = repair_satisfied
+
+                conditioned_metrics.update({
+                    "active_feature_names": [
+                        name for name, active in zip(
+                            self.config["dataset"]["feature_names"],
+                            self.active_feature_mask,
+                        )
+                        if active
+                    ],
+                    "number_of_active_features": sum(self.active_feature_mask),
+                })
 
             injection_validation = self.drift_injector.validate(
                 index,
@@ -387,7 +468,7 @@ class DriftAdaptPipeline:
             defaults.update(adaptation)
             adaptation = defaults
             after_f1 = (
-                macro_f1(window.labels, self._predict(self.model, stream_features))
+                macro_f1(window.labels, self._predict(self.model, student_features))
                 if event else None
             )
             adaptation_labeling_time = (
