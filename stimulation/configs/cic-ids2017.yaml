@@ -15,6 +15,7 @@ dataset:
   normalize: false
 model:
   class: ID_CIC_IDS2017_small_pforest
+  simulation_class: ID_CIC_IDS2017_elastic_pforest
   checkpoint: ../checkpoint/cic-ids2017-in-network-dnn.pt
 labeler:
   type: dnn
@@ -27,6 +28,7 @@ driftadapt:
   parameter_bits: 32
 drift_conditioned:
   adapter_checkpoint: ../checkpoint/cic-ids2017-drift-adapter.pt
+  simulation_adapter_checkpoint: ../checkpoint/cic-ids2017-capacity-drift-adapter.pt
   confidence_threshold: 0.50
   module_threshold: 0.50
   signature_shift_clip: 8.0
@@ -35,6 +37,21 @@ feature_reconfiguration:
   active_feature_budget: 16
   minimum_oracle_gain: 0.02
   max_candidate_masks: 32
+capacity:
+  enabled: true
+  initial_layer1: 8
+  initial_layer2: 4
+  max_layer1: 16
+  max_layer2: 8
+  residual_f1_threshold: 0.05
+  saturation_threshold: 0.75
+  layer1_expand_step: 2
+  layer2_expand_step: 1
+  min_improvement: 0.0
+  contraction_enabled: true
+  contraction_utility_threshold: 0.01
+  contraction_patience: 10
+  initialization_noise: 0.001
 drift:
   bins: 16
   threshold: 0.10

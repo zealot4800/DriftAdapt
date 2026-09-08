@@ -14,6 +14,7 @@ def main() -> None:
     stimulation_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(stimulation_root))
     from src.adapter import evaluate_adapter, save_adapter_bundle, train_drift_adapter
+    from src.capacity import resolve_capacity_config
     from src.data import resolve_path
     from src.drift_dataset import (
         analyze_drift_repair_learnability,
@@ -57,7 +58,15 @@ def main() -> None:
     seed = int(config.get("runtime", {}).get("seed", 42))
     artifact = load_drift_repair_dataset(args.dataset.resolve())
     model_config = config["model"]
-    model = build_model(model_config["class"], model_config.get("kwargs"))
+    capacity_enabled = resolve_capacity_config(config.get("capacity"))["enabled"]
+    offline_model = (
+        model_config.get("simulation_class", model_config["class"])
+        if capacity_enabled else model_config["class"]
+    )
+    model = build_model(
+        offline_model,
+        model_config.get("kwargs"),
+    )
     load_checkpoint(
         model, str(resolve_path(model_config["checkpoint"], config_path.parent)),
         torch.device("cpu"),
@@ -172,7 +181,14 @@ def main() -> None:
     )
     print(f"Scientific report: {report}")
     if not validation["scientific_validation_passed"]:
-        raise SystemExit("Scientific validation failed; adapter checkpoint was not written")
+        stale_warning = (
+            f" Existing checkpoint {output} was not overwritten and may be stale."
+            if output.exists() else ""
+        )
+        raise SystemExit(
+            "Scientific validation failed; adapter checkpoint was not written."
+            + stale_warning
+        )
     save_adapter_bundle(bundle, output, {
         "training": training_report,
         "scientific_validation": validation,

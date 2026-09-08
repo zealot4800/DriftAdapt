@@ -13,6 +13,7 @@ import yaml
 def main() -> None:
     stimulation_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(stimulation_root))
+    from src.capacity import resolve_capacity_config
     from src.data import StreamingDataset, resolve_path
     from src.drift_dataset import (
         analyze_drift_repair_learnability,
@@ -48,7 +49,15 @@ def main() -> None:
     dataset = StreamingDataset(dataset_config, config_path.parent, device)
     windows = list(dataset.windows(int(config["stream"]["window_size"])))
     model_config = config["model"]
-    model = build_model(model_config["class"], model_config.get("kwargs")).to(device)
+    capacity_enabled = resolve_capacity_config(config.get("capacity"))["enabled"]
+    offline_model = (
+        model_config.get("simulation_class", model_config["class"])
+        if capacity_enabled else model_config["class"]
+    )
+    model = build_model(
+        offline_model,
+        model_config.get("kwargs"),
+    ).to(device)
     load_checkpoint(
         model, str(resolve_path(model_config["checkpoint"], config_path.parent)), device,
     )

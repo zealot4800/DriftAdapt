@@ -11,6 +11,7 @@ dataset:
   normalize: false
 model:
   class: ID_UNSW_NB15_N3IC
+  simulation_class: ID_UNSW_NB15_elastic_N3IC
   kwargs: {input_shape: 20, neurons: [32, 16, 2]}
   checkpoint: ../checkpoint/unsw-nb15-in-network-dnn.pt
 labeler:
@@ -22,6 +23,7 @@ driftadapt:
   parameter_bits: 32
 drift_conditioned:
   adapter_checkpoint: ../checkpoint/unsw-nb15-drift-adapter.pt
+  simulation_adapter_checkpoint: ../checkpoint/unsw-nb15-capacity-drift-adapter.pt
   confidence_threshold: 0.50
   module_threshold: 0.50
   signature_shift_clip: 8.0
@@ -30,6 +32,21 @@ feature_reconfiguration:
   active_feature_budget: 20
   minimum_oracle_gain: 0.02
   max_candidate_masks: 32
+capacity:
+  enabled: true
+  initial_layer1: 32
+  initial_layer2: 16
+  max_layer1: 64
+  max_layer2: 32
+  residual_f1_threshold: 0.05
+  saturation_threshold: 0.75
+  layer1_expand_step: 8
+  layer2_expand_step: 4
+  min_improvement: 0.0
+  contraction_enabled: true
+  contraction_utility_threshold: 0.01
+  contraction_patience: 10
+  initialization_noise: 0.001
 drift:
   bins: 16
   threshold: 0.10

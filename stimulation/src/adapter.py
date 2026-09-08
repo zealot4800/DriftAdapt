@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -255,18 +256,14 @@ def train_drift_adapter(
     }
 
 
-@torch.inference_mode()
-def predict_repair(
+def _prediction_state(
     bundle: AdapterBundle,
     signature_vector: list[float] | torch.Tensor,
     *,
-    module_threshold: float = 0.50,
-    parameter_bits: int = 32,
-) -> tuple[RepairPlan, dict]:
+    module_threshold: float,
+) -> dict:
     if not 0.0 <= module_threshold <= 1.0:
         raise ValueError("adapter.module_threshold must be between zero and one")
-    if parameter_bits < 1:
-        raise ValueError("parameter_bits must be positive")
     signature = torch.as_tensor(signature_vector, dtype=torch.float32).flatten()
     if signature.numel() != bundle.signature_size:
         raise ValueError("Drift signature does not match the trained adapter input")
@@ -280,9 +277,35 @@ def predict_repair(
         name for index, name in enumerate(bundle.module_names)
         if probabilities[index] >= module_threshold and bundle.repair_prototypes[name]
     ]
-    feature_mask = _decode_feature_mask(
-        feature_probabilities, _compatible_feature_masks(bundle, selected),
-    )
+    return {
+        "signature": signature,
+        "probabilities": probabilities,
+        "magnitudes": magnitudes,
+        "feature_probabilities": feature_probabilities,
+        "confidence": confidence,
+        "selected": selected,
+    }
+
+
+def _build_plan_for_mask(
+    bundle: AdapterBundle,
+    state: dict,
+    feature_mask: Sequence[int],
+    *,
+    parameter_bits: int,
+) -> tuple[RepairPlan, dict]:
+    if parameter_bits < 1:
+        raise ValueError("parameter_bits must be positive")
+    normalized_mask = [int(value) for value in feature_mask]
+    compatible = _compatible_feature_masks(bundle, state["selected"])
+    if tuple(normalized_mask) not in compatible:
+        raise ValueError("Requested feature mask has no compatible repair prototypes")
+
+    signature = state["signature"]
+    selected = state["selected"]
+    magnitudes = state["magnitudes"]
+    confidence = state["confidence"]
+    feature_mask = normalized_mask
     needs_weight_repair = bool(selected) or feature_mask != bundle.default_feature_mask
     parameter_deltas: dict[str, torch.Tensor] = {}
     selected_prototypes: dict[str, int] = {}
@@ -346,18 +369,104 @@ def predict_repair(
         feature_mask=feature_mask,
     )
     return plan, {
-        "adapter_confidence": confidence,
-        "adapter_module_probabilities": {
-            name: float(probabilities[index].item())
-            for index, name in enumerate(bundle.module_names)
-        },
-        "predicted_modules": selected,
-        "predicted_module_magnitudes": magnitude_map,
-        "predicted_feature_mask": feature_mask,
+        "repair_feature_mask": feature_mask,
         "selected_repair_prototypes": selected_prototypes,
         "selected_classifier_repair_prototype": classifier_prototype,
         "predicted_repair_parameter_count": plan.update_parameter_count,
         "predicted_repair_update_bytes": plan.update_bytes,
+    }
+
+
+def _prediction_metrics(bundle: AdapterBundle, state: dict) -> dict:
+    return {
+        "adapter_confidence": state["confidence"],
+        "adapter_module_probabilities": {
+            name: float(state["probabilities"][index].item())
+            for index, name in enumerate(bundle.module_names)
+        },
+        "predicted_modules": list(state["selected"]),
+        "predicted_module_magnitudes": {
+            name: float(state["magnitudes"][index].item())
+            for index, name in enumerate(bundle.module_names)
+        },
+    }
+
+
+@torch.inference_mode()
+def predict_repair(
+    bundle: AdapterBundle,
+    signature_vector: list[float] | torch.Tensor,
+    *,
+    module_threshold: float = 0.50,
+    parameter_bits: int = 32,
+) -> tuple[RepairPlan, dict]:
+    """Predict the existing joint mask-compatible repair candidate."""
+    state = _prediction_state(
+        bundle, signature_vector, module_threshold=module_threshold,
+    )
+    feature_mask = _decode_feature_mask(
+        state["feature_probabilities"],
+        _compatible_feature_masks(bundle, state["selected"]),
+    )
+    plan, plan_metrics = _build_plan_for_mask(
+        bundle, state, feature_mask, parameter_bits=parameter_bits,
+    )
+    return plan, {
+        **_prediction_metrics(bundle, state),
+        "predicted_feature_mask": feature_mask,
+        **plan_metrics,
+    }
+
+
+@torch.inference_mode()
+def predict_staged_repair(
+    bundle: AdapterBundle,
+    signature_vector: list[float] | torch.Tensor,
+    current_feature_mask: Sequence[int],
+    *,
+    module_threshold: float = 0.50,
+    parameter_bits: int = 32,
+) -> tuple[RepairPlan, list[int] | None, dict]:
+    """Build strict weight-first and optional feature-stage repair plans.
+
+    The plan retains the currently deployed mask, so it is a true weight-only
+    stage. The optional feature-stage result is only a mask: runtime applies it
+    to the already weight-repaired model without applying a second set of
+    weight deltas. Runtime decides whether that mask is needed only after
+    evaluating the weight stage.
+    """
+    state = _prediction_state(
+        bundle, signature_vector, module_threshold=module_threshold,
+    )
+    current = [int(value) for value in current_feature_mask]
+    compatible = _compatible_feature_masks(bundle, state["selected"])
+    if tuple(current) not in compatible:
+        raise ValueError("Current feature mask has no compatible repair prototypes")
+
+    weight_plan, weight_metrics = _build_plan_for_mask(
+        bundle, state, current, parameter_bits=parameter_bits,
+    )
+    feature_candidates = [
+        mask for mask in compatible
+        if tuple(mask) != tuple(current)
+    ] if bundle.feature_reconfiguration_config["enabled"] else []
+    feature_mask = None
+    if feature_candidates:
+        feature_mask = _decode_feature_mask(
+            state["feature_probabilities"], feature_candidates,
+        )
+
+    predicted_feature_mask = (
+        list(feature_mask) if feature_mask is not None else current
+    )
+    return weight_plan, feature_mask, {
+        **_prediction_metrics(bundle, state),
+        "predicted_feature_mask": predicted_feature_mask,
+        "weight_stage_prediction": weight_metrics,
+        "feature_stage_prediction": (
+            {"feature_mask": list(feature_mask)}
+            if feature_mask is not None else None
+        ),
     }
 
 

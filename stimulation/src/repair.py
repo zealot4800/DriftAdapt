@@ -221,6 +221,13 @@ def apply_repair_plan(
                     )
             offset += count
 
+    # Base-relative repair must not erase capacity that was activated and
+    # trained after the immutable repair anchor was created.  Elastic models
+    # copy only their capacity-owned masks/slices; ordinary models have no
+    # such state and retain the existing behavior.
+    if anchor_model is not None and hasattr(candidate, "preserve_capacity_state_from"):
+        candidate.preserve_capacity_state_from(model)
+
     active_parameters = dict(model.named_parameters())
     candidate_parameters = dict(candidate.named_parameters())
     if list(active_parameters) != list(candidate_parameters):
