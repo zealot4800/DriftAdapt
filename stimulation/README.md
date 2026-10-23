@@ -1,10 +1,24 @@
-# DriftAdapt simulation
+# CARAVAN, DriftAdapt and SiteGuard simulation
 
-This directory contains the CARAVAN baseline and the experimental
-drift-conditioned DriftAdapt workflow. Both use the same streaming datasets,
-MLPs, feature ordering, checkpoints, histogram/JSD drift monitor, and result
-formats. The runtime interface intentionally exposes only `caravan` and
-`drift_conditioned`.
+This directory contains three architectures behind the same `run.py` entry
+point and dataset configurations: `caravan`, `driftadapt` (also spelled
+`drift_conditioned`), and `siteguard`. CARAVAN and DriftAdapt share the flow
+datasets, MLPs, checkpoints and histogram/JSD monitor. SiteGuard uses packet
+windows, spectral features, an autoencoder and a one-class detector, with its
+implementation alongside the other architecture code in `src/`.
+
+```bash
+python run.py --config configs/cic-ids2017.yaml --mode caravan
+python run.py --config configs/cic-ids2017.yaml --mode driftadapt
+python run.py --config configs/cic-ids2017.yaml --mode siteguard --action audit
+```
+
+Each existing dataset YAML contains a `siteguard` section; there is no separate
+SiteGuard YAML or runner. SiteGuard's `audit` action works on the bundled flow
+CSVs. Training/inference require packet CSVs because aggregate flows cannot
+reconstruct packet sequences or packet-time statistics. See
+[SiteGuard configuration and commands](SITEGUARD.md) for training, frozen
+inference, feedback-driven adaptation, input requirements and fidelity limits.
 
 ## Install and run
 
@@ -108,7 +122,9 @@ feature is reported as drifted. This monitor observes only input features.
 Results include per-feature JSD scores, drifted indices and names, and the
 fixed histogram counter/state cost for later hardware sizing.
 
-`driftadapt.mode` selects one of two runtime policies:
+`--mode` selects the architecture, overriding an optional top-level
+`architecture` or the existing `driftadapt.mode` YAML setting. The existing
+flow-based policies are:
 
 - `caravan` labels every complete window, applies the original accuracy-proxy
   trigger, fully retrains the active model, and preserves the CARAVAN baseline.
@@ -118,6 +134,11 @@ fixed histogram counter/state cost for later hardware sizing.
   the optional software-only capacity experiment described below explicitly
   uses simulation-oracle labels for staged recovery evaluation and selective
   capacity training.
+
+`driftadapt` is an alias for `drift_conditioned`. The third architecture,
+`siteguard`, uses its own model settings under `siteguard` in the same YAML;
+it shares `runtime.seed`, the dataset name, and the output root. Its outputs
+remain window-level metrics and do not imply per-flow classification.
 
 The old `baseline_caravan` spelling is accepted as a deprecated alias for
 `caravan`.

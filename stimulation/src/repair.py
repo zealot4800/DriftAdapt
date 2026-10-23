@@ -118,6 +118,27 @@ def extract_oracle_repair(
     }
 
 
+@torch.no_grad()
+def _apply_module_delta(
+    name: str, module: nn.Module, delta: torch.Tensor, anchor: nn.Module | None,
+) -> None:
+    parameters = list(module.parameters())
+    delta = delta.to(parameters[0]).flatten()
+    expected = sum(parameter.numel() for parameter in parameters)
+    if delta.numel() != expected:
+        raise ValueError(f"Repair delta for {name} has {delta.numel()} values; expected {expected}")
+    anchors = list(anchor.parameters()) if anchor is not None else None
+    offset = 0
+    for index, parameter in enumerate(parameters):
+        count = parameter.numel()
+        update = delta[offset:offset + count].view_as(parameter)
+        if anchors is None:
+            parameter.add_(update)
+        else:
+            parameter.copy_(anchors[index].to(parameter) + update)
+        offset += count
+
+
 def apply_repair_plan(
     model: nn.Module,
     plan: RepairPlan,
@@ -161,28 +182,10 @@ def apply_repair_plan(
         raise ValueError("Repair anchor hidden-module layout does not match the model")
 
     for name in plan.affected_modules:
-        delta = plan.parameter_deltas[name].to(
-            device=next(modules[name].parameters()).device,
-            dtype=next(modules[name].parameters()).dtype,
-        ).flatten()
-        expected = sum(parameter.numel() for parameter in modules[name].parameters())
-        if delta.numel() != expected:
-            raise ValueError(f"Repair delta for {name} has {delta.numel()} values; expected {expected}")
-        offset = 0
-        anchor_parameters = (
-            list(anchor_modules[name].parameters()) if anchor_modules is not None else []
+        _apply_module_delta(
+            name, modules[name], plan.parameter_deltas[name],
+            anchor_modules[name] if anchor_modules is not None else None,
         )
-        for parameter_index, parameter in enumerate(modules[name].parameters()):
-            count = parameter.numel()
-            update = delta[offset:offset + count].view_as(parameter)
-            with torch.no_grad():
-                if anchor_modules is None:
-                    parameter.add_(update)
-                else:
-                    parameter.copy_(
-                        anchor_parameters[parameter_index].to(parameter) + update
-                    )
-            offset += count
 
     if plan.classifier_delta is not None:
         classifier_name, classifier = candidate.named_classifier_module()
@@ -190,36 +193,12 @@ def apply_repair_plan(
             raise ValueError(
                 f"Repair classifier {plan.classifier_name!r} does not match {classifier_name!r}"
             )
-        delta = plan.classifier_delta.to(
-            device=next(classifier.parameters()).device,
-            dtype=next(classifier.parameters()).dtype,
-        ).flatten()
-        expected = sum(parameter.numel() for parameter in classifier.parameters())
-        if delta.numel() != expected:
-            raise ValueError(
-                f"Repair delta for {classifier_name} has {delta.numel()} values; "
-                f"expected {expected}"
-            )
         anchor_classifier = None
         if anchor_model is not None:
             anchor_classifier_name, anchor_classifier = anchor_model.named_classifier_module()
             if anchor_classifier_name != classifier_name:
                 raise ValueError("Repair anchor classifier layout does not match the model")
-        anchor_parameters = (
-            list(anchor_classifier.parameters()) if anchor_classifier is not None else []
-        )
-        offset = 0
-        for parameter_index, parameter in enumerate(classifier.parameters()):
-            count = parameter.numel()
-            update = delta[offset:offset + count].view_as(parameter)
-            with torch.no_grad():
-                if anchor_classifier is None:
-                    parameter.add_(update)
-                else:
-                    parameter.copy_(
-                        anchor_parameters[parameter_index].to(parameter) + update
-                    )
-            offset += count
+        _apply_module_delta(classifier_name, classifier, plan.classifier_delta, anchor_classifier)
 
     # Base-relative repair must not erase capacity that was activated and
     # trained after the immutable repair anchor was created.  Elastic models

@@ -216,6 +216,10 @@ def capacity_selective_retrain_model(
         key: parameter.detach().clone()
         for key, (parameter, _) in parameter_masks.items()
     }
+    frozen_slices = {}
+    for key, (_, mask) in parameter_masks.items():
+        frozen = ~mask
+        frozen_slices[key] = frozen, snapshots[key][frozen]
     hook_handles = []
     trainable_parameters: list[nn.Parameter] = []
     trainable_element_count = 0
@@ -253,12 +257,14 @@ def capacity_selective_retrain_model(
                 loss.backward()
                 optimizer.step()
                 with torch.no_grad():
-                    for key, (parameter, mask) in parameter_masks.items():
-                        parameter[~mask] = snapshots[key][~mask]
+                    for key, (parameter, _) in parameter_masks.items():
+                        frozen, values = frozen_slices[key]
+                        parameter[frozen] = values
         model.eval()
 
-        for key, (parameter, mask) in parameter_masks.items():
-            if not torch.equal(parameter.detach()[~mask], snapshots[key][~mask]):
+        for key, (parameter, _) in parameter_masks.items():
+            frozen, values = frozen_slices[key]
+            if not torch.equal(parameter.detach()[frozen], values):
                 raise RuntimeError("Capacity training changed a frozen parameter element")
     finally:
         for handle in hook_handles:

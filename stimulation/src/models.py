@@ -13,6 +13,14 @@ def _init_weights(module: nn.Module) -> None:
         nn.init.zeros_(module.bias)
 
 
+def _two_hidden_stack(input_size: int, first: int, second: int, output_size: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(input_size, first), nn.ReLU(),
+        nn.Linear(first, second), nn.ReLU(),
+        nn.Linear(second, output_size), nn.Softmax(dim=1),
+    )
+
+
 class InferenceModel(nn.Module):
     def run_inference(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scores = self.forward(x)
@@ -40,10 +48,7 @@ class InferenceModel(nn.Module):
 class ID_CIC_IDS2017_small_pforest(InferenceModel):
     def __init__(self) -> None:
         super().__init__()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 4), nn.ReLU(),
-            nn.Linear(4, 2), nn.Softmax(dim=1),
-        )
+        self.linear_relu_stack = _two_hidden_stack(16, 8, 4, 2)
         self.linear_relu_stack.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -77,10 +82,9 @@ class ElasticTwoHiddenLayerModel(InferenceModel):
 
     def __init__(self) -> None:
         super().__init__()
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(self.input_features, self.max_layer1_neurons), nn.ReLU(),
-            nn.Linear(self.max_layer1_neurons, self.max_layer2_neurons), nn.ReLU(),
-            nn.Linear(self.max_layer2_neurons, self.output_classes), nn.Softmax(dim=1),
+        self.linear_relu_stack = _two_hidden_stack(
+            self.input_features, self.max_layer1_neurons,
+            self.max_layer2_neurons, self.output_classes,
         )
         self.linear_relu_stack.apply(_init_weights)
         self.register_buffer(
@@ -460,11 +464,12 @@ class ElasticTwoHiddenLayerModel(InferenceModel):
         if layer2_sources:
             copied["linear_relu_stack.4.weight"][:, layer2_sources] = True
         source_deltas = source._capacity_training_deltas()
+        target_deltas = self._capacity_training_deltas()
         for name, parameter in parameters.items():
             delta = source_deltas[name].to(parameter)
             retained = ~copied[name]
             parameter[retained] = parameter[retained] + delta[retained]
-            self._capacity_training_deltas()[name].copy_(source_deltas[name].to(delta))
+            target_deltas[name].copy_(source_deltas[name].to(delta))
         self.layer1_mask.copy_(source.layer1_mask.to(self.layer1_mask))
         self.layer2_mask.copy_(source.layer2_mask.to(self.layer2_mask))
         self.layer1_clone_sources.copy_(
@@ -570,11 +575,7 @@ class ID_UNSW_NB15_N3IC(InferenceModel):
     def __init__(self, input_shape: int = 20, neurons: list[int] | None = None) -> None:
         super().__init__()
         neurons = neurons or [32, 16, 2]
-        self.model = nn.Sequential(
-            nn.Linear(input_shape, neurons[0]), nn.ReLU(),
-            nn.Linear(neurons[0], neurons[1]), nn.ReLU(),
-            nn.Linear(neurons[1], neurons[2]), nn.Softmax(dim=1),
-        )
+        self.model = _two_hidden_stack(input_shape, neurons[0], neurons[1], neurons[2])
         self.model.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -585,11 +586,7 @@ class UNSW_IoT_N3IC(InferenceModel):
     def __init__(self, input_shape: int = 16, neurons: list[int] | None = None) -> None:
         super().__init__()
         neurons = neurons or [64, 32, 10]
-        self.model = nn.Sequential(
-            nn.Linear(input_shape, neurons[0]), nn.ReLU(),
-            nn.Linear(neurons[0], neurons[1]), nn.ReLU(),
-            nn.Linear(neurons[1], neurons[2]), nn.Softmax(dim=1),
-        )
+        self.model = _two_hidden_stack(input_shape, neurons[0], neurons[1], neurons[2])
         self.model.apply(_init_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

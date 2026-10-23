@@ -66,3 +66,64 @@ trigger:
   threshold: 0.20
 runtime: {device: cuda, seed: 42}
 output: {directory: results}
+
+# SiteGuard uses packet metadata; bundled flow CSVs can be audited only.
+siteguard:
+  action: infer
+  source_packets: null
+  evaluation_packets: null
+  feedback: null
+  verified_benign_source: false
+  checkpoint: ../checkpoint/unsw-nb15-siteguard.pt
+  threads: 1
+  # Paper: https://netsyscode.github.io/netsyslab/papers/isp-centric-ids.pdf
+  features:
+    window_seconds: 5.0
+    sequence_length: 5
+    sampled_sessions: 100
+    session_timeout_seconds: 30.0
+    history_windows: 10
+    zero_baseline_epsilon: 0.000001
+    # Table 4 order. Within each base feature: count, rate, baseline, deviation.
+    granularities: [dst_ip, dst_port, src_dst_ip, src_sock, dst_sock]
+    measurements: [pkts, bytes, ports, src_ips]
+    sequence_order: [packet_size, interval_time, jitter, protocol, payload_size]
+    # Optional supplied session semantics; never guessed from encrypted bytes.
+    tls_enabled: false
+    tls_fields: [tls_has_heartbeat, tls_cipher_suites_cnt, tls_extensions_cnt,
+                 tls_has_SNI, tls_sup_heartbeat, cert_self_signed,
+                 cert_validity_duration, cert_SNI_in_SAN]
+    # Underspecified in the paper: sum packet/byte groups, max cardinalities.
+    group_reduction: [sum, sum, max, max]
+    short_window_policy: zero_pad_embeddings
+    window_label_policy: any_attack
+  dft:
+    norm: backward
+    frequency_order: paper_one_based
+    c_min: 0
+    c_max: 10
+    clip: true
+  autoencoder:
+    channels: 16
+    residual_blocks: 2
+    latent_dim: 8
+    epochs: 20
+    batch_size: 128
+    learning_rate: 0.001
+  classifier:
+    # Explicit correction of the malformed Eq. (1), explained in README.
+    objective: slack_corrected_linear
+    nu: 0.1
+    tolerance: 0.0001
+    max_iterations: 100000
+  online:
+    beta: 0.10
+    delta: 0.05
+    feedback_window: 100
+    minimum_benign_feedback: 10
+    learning_rate: 0.01
+    schedule: inverse_sqrt
+  server:
+    # SUM count slots, MAX rate/baseline/deviation slots; fixed victim vocabulary
+    # is supplied by the caller from source data, with a final unknown-victim slot.
+    digest_fields: [packets, bytes]

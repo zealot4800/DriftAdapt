@@ -4,6 +4,9 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import torch
+from torch import nn
+
 
 CAPACITY_EVENT_TYPES = frozenset({"expand", "contract", "rejected_expand"})
 
@@ -17,10 +20,9 @@ def _boolean(value: Any, name: str) -> bool:
 def _integer(value: Any, name: str, *, minimum: int = 1) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"capacity.{name} must be an integer")
-    converted = value
-    if converted < minimum:
+    if value < minimum:
         raise ValueError(f"capacity.{name} must be at least {minimum}")
-    return converted
+    return value
 
 
 def _finite_float(value: Any, name: str) -> float:
@@ -331,3 +333,136 @@ def make_capacity_event(
         "accepted": accepted,
         "model_version": _integer(model_version, "model_version", minimum=0),
     }
+
+
+def select_impacted_modules(scores: dict[str, float], threshold: float) -> list[str]:
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("adaptation.impact_threshold must be between 0 and 1")
+    return [name for name, score in scores.items() if score >= threshold]
+
+
+def _normalize_vector(values: torch.Tensor) -> torch.Tensor:
+    maximum = values.max() if values.numel() else values.new_tensor(0.0)
+    return values / maximum if maximum > 0 else torch.zeros_like(values)
+
+
+@torch.inference_mode()
+def map_drift_to_neural_impact(
+    model: nn.Module,
+    feature_drift_scores: dict[str, float | None],
+    threshold: float,
+    activation_magnitudes: dict[str, torch.Tensor] | None = None,
+) -> dict:
+    """Propagate a fixed JSD vector through hidden-layer absolute weights."""
+    hidden_modules = model.named_hidden_modules()
+    if not hidden_modules:
+        return {
+            "impacted_neuron_scores": {},
+            "module_impact_scores": {},
+            "impact_selected_modules": [],
+            "affected_parameter_count": 0,
+            "affected_parameter_percentage": 0.0,
+            "impact_state_elements": len(feature_drift_scores),
+            "impact_multiply_accumulate_count": 0,
+        }
+
+    first_module = next(iter(hidden_modules.values()))
+    drift_vector = torch.tensor(
+        [0.0 if score is None else score for score in feature_drift_scores.values()],
+        dtype=first_module.weight.dtype,
+        device=first_module.weight.device,
+    )
+    drift_vector = torch.nan_to_num(drift_vector, nan=0.0, posinf=1.0, neginf=0.0)
+    if drift_vector.numel() != first_module.in_features:
+        raise ValueError("Feature drift vector does not match the model input size")
+
+    neuron_masks = (
+        model.hidden_neuron_masks()
+        if hasattr(model, "hidden_neuron_masks") else {}
+    )
+    neuron_scores: dict[str, list[float]] = {}
+    raw_module_scores: dict[str, float] = {}
+    propagated = drift_vector
+    multiply_accumulates = 0
+    neuron_state_elements = 0
+    for name, module in hidden_modules.items():
+        if propagated.numel() != module.in_features:
+            raise ValueError(f"Hidden module {name} does not match the preceding impact vector")
+        impact = torch.mv(module.weight.detach().abs(), propagated)
+        if activation_magnitudes and name in activation_magnitudes:
+            activation = activation_magnitudes[name].to(impact).abs().flatten()
+            if activation.numel() != impact.numel():
+                raise ValueError(f"Activation magnitude for {name} has the wrong size")
+            impact = impact * activation
+        active_mask = None
+        if name in neuron_masks:
+            mask = neuron_masks[name].to(device=impact.device, dtype=impact.dtype).flatten()
+            if mask.numel() != impact.numel():
+                raise ValueError(f"Neuron mask for {name} has the wrong size")
+            impact = impact * mask
+            active_mask = mask.to(torch.bool)
+        normalized = _normalize_vector(impact)
+        neuron_scores[name] = normalized.detach().cpu().tolist()
+        active_scores = normalized if active_mask is None else normalized[active_mask]
+        raw_module_scores[name] = float(active_scores.mean().item())
+        propagated = normalized
+        multiply_accumulates += module.weight.numel()
+        neuron_state_elements += module.out_features
+
+    maximum_module_score = max(raw_module_scores.values(), default=0.0)
+    module_scores = {
+        name: score / maximum_module_score if maximum_module_score > 0 else 0.0
+        for name, score in raw_module_scores.items()
+    }
+    selected = select_impacted_modules(module_scores, threshold)
+    affected_parameters = sum(
+        parameter.numel()
+        for name in selected
+        for parameter in hidden_modules[name].parameters()
+    )
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    return {
+        "impacted_neuron_scores": neuron_scores,
+        "module_impact_scores": module_scores,
+        "impact_selected_modules": selected,
+        "affected_parameter_count": affected_parameters,
+        "affected_parameter_percentage": 100.0 * affected_parameters / total_parameters,
+        "impact_state_elements": (
+            drift_vector.numel() + neuron_state_elements + len(hidden_modules)
+        ),
+        "impact_multiply_accumulate_count": multiply_accumulates,
+    }
+
+
+@torch.inference_mode()
+def select_drift_associated_samples(
+    features: torch.Tensor,
+    drift_scores: dict[str, float | None],
+    drifted_feature_indices: list[int],
+    range_min: torch.Tensor,
+    range_max: torch.Tensor,
+    *,
+    enabled: bool,
+    max_samples: int,
+) -> torch.Tensor:
+    """Select a deterministic, bounded, stream-ordered drift-associated subset."""
+    if not drifted_feature_indices:
+        return torch.empty(0, dtype=torch.long, device=features.device)
+    if not enabled:
+        return torch.arange(features.shape[0], device=features.device)
+    if max_samples < 1:
+        raise ValueError("sample_selection.max_samples must be positive")
+
+    indices = torch.tensor(drifted_feature_indices, dtype=torch.long, device=features.device)
+    span = (range_max[indices] - range_min[indices]).clamp_min(1e-6)
+    center = 0.5 * (range_max[indices] + range_min[indices])
+    drift_values = list(drift_scores.values())
+    jsd = torch.tensor(
+        [drift_values[index] or 0.0 for index in drifted_feature_indices],
+        dtype=features.dtype,
+        device=features.device,
+    )
+    scores = (((features[:, indices] - center).abs() / span) * jsd).sum(dim=1)
+    count = min(max_samples, max(features.shape[0] - 1, 0))
+    selected = torch.argsort(scores, descending=True, stable=True)[:count]
+    return torch.sort(selected).values

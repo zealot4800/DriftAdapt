@@ -13,21 +13,21 @@ from .capacity import (
     capacity_pressure_decision,
     capacity_ratios,
     make_capacity_event,
+    map_drift_to_neural_impact,
     neuron_saturation,
     residual_recovery_status,
     resolve_capacity_config,
+    select_drift_associated_samples,
 )
+from . import create_pipeline  # Compatibility re-export of the shared factory.
 from .data import StreamingDataset, resolve_path
-from .drift import COUNTER_BITS, FeatureHistogramDriftDetector
+from .drift import COUNTER_BITS, FeatureHistogramDriftDetector, TrafficDriftInjector
 from .drift_dataset import resolve_feature_reconfiguration_config
-from .drift_injector import TrafficDriftInjector
 from .drift_signature import build_drift_signature
 from .labelers import ABSTAIN, build_labeler
-from .impact import map_drift_to_neural_impact
 from .metrics import macro_f1, mean
 from .models import ElasticTwoHiddenLayerModel, build_model, load_checkpoint
 from .repair import apply_feature_mask, apply_repair_plan
-from .selector import select_drift_associated_samples
 from .trainer import (
     capacity_selective_retrain_model,
     form_training_set,
@@ -222,15 +222,7 @@ class DriftAdaptPipeline:
                 self.device
             )
         self.model_version = 0
-        self.drift_event_handled = False
-        self.drift_event_repair_attempted = False
-        self.drift_event_pre_repair_model = None
-        self.drift_event_pre_repair_feature_mask: list[int] | None = None
-        self.drift_event_pending_feature_mask: list[int] | None = None
-        self.drift_event_feature_stage_status = "not_started"
-        self.drift_event_stage_order: list[str] = []
-        self.drift_event_weight_repair_f1: float | None = None
-        self.drift_event_feature_reconfiguration_f1: float | None = None
+        self._reset_drift_event_state()
         self.last_non_drift_f1: float | None = None
         self.capacity_low_utility_streaks: dict[str, torch.Tensor] = {}
         if self.capacity_enabled:

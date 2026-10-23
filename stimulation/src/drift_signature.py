@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from .drift import fixed_histogram_counts
+
 
 SIGNATURE_FIELDS = (
     "jsd",
@@ -39,26 +41,6 @@ def _histogram_statistics(
     return means, variances.clamp_min(0.0).sqrt(), medians
 
 
-def _fixed_histogram_counts(
-    features: torch.Tensor,
-    minimum: torch.Tensor,
-    maximum: torch.Tensor,
-    bins: int,
-) -> torch.Tensor:
-    span = maximum - minimum
-    safe_span = torch.where(span > 0, span, torch.ones_like(span))
-    indices = torch.floor((features - minimum) * bins / safe_span).long()
-    indices.clamp_(0, bins - 1)
-    counts = torch.zeros(
-        (features.shape[1], bins), dtype=torch.int64, device=features.device,
-    )
-    for feature_index in range(features.shape[1]):
-        counts[feature_index] = torch.bincount(
-            indices[:, feature_index], minlength=bins,
-        )
-    return counts
-
-
 @torch.inference_mode()
 def build_drift_signature(
     feature_names: list[str],
@@ -87,7 +69,7 @@ def build_drift_signature(
     reference_mean, reference_std, reference_median = _histogram_statistics(
         reference_counts, range_min, range_max,
     )
-    current_counts = _fixed_histogram_counts(
+    current_counts = fixed_histogram_counts(
         current_features, range_min, range_max, reference_counts.shape[1],
     )
     current_mean, current_std, current_median = _histogram_statistics(

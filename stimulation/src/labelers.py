@@ -15,6 +15,18 @@ from .models import build_model, load_checkpoint
 ABSTAIN = -1
 
 
+def _label_batches(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
+    del generated_labels
+    values = raw_features if raw_features is not None else features
+    rows = values.detach().cpu().tolist()
+    labels: list[int] = []
+    for start in range(0, len(rows), self.batch_size):
+        labels.extend(self._label_batch(rows[start:start + self.batch_size]))
+    return torch.tensor(
+        labels, dtype=torch.long, device=features.device,
+    )
+
+
 class DNNLabeler:
     def __init__(self, config: dict[str, Any], device: torch.device) -> None:
         self.model = build_model(config["class"], config.get("kwargs")).to(device)
@@ -48,16 +60,7 @@ class OllamaLabeler:
         if self.batch_size < 1:
             raise ValueError("OLLAMA_BATCH_SIZE must be at least 1")
 
-    def label(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
-        del generated_labels
-        values = raw_features if raw_features is not None else features
-        rows = values.detach().cpu().tolist()
-        labels: list[int] = []
-        for start in range(0, len(rows), self.batch_size):
-            labels.extend(self._label_batch(rows[start:start + self.batch_size]))
-        return torch.tensor(
-            labels, dtype=torch.long, device=features.device,
-        )
+    label = _label_batches
 
     def _label_batch(self, rows: list[list[float]]) -> list[int]:
         prompt = _classification_prompt(rows, self.feature_names)
@@ -109,16 +112,7 @@ class OpenAILabeler:
         if self.batch_size < 1 or self.max_retries < 0:
             raise ValueError("OPENAI_BATCH_SIZE must be positive and OPENAI_MAX_RETRIES nonnegative")
 
-    def label(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
-        del generated_labels
-        values = raw_features if raw_features is not None else features
-        rows = values.detach().cpu().tolist()
-        labels: list[int] = []
-        for start in range(0, len(rows), self.batch_size):
-            labels.extend(self._label_batch(rows[start:start + self.batch_size]))
-        return torch.tensor(
-            labels, dtype=torch.long, device=features.device,
-        )
+    label = _label_batches
 
     def _label_batch(self, rows: list[list[float]]) -> list[int]:
         schema = _labels_schema(len(rows))

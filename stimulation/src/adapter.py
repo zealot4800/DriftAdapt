@@ -109,14 +109,10 @@ def _training_tensors(records: list[dict], module_names: list[str]):
     return signatures, selected, magnitudes, feature_masks, confidence
 
 
-def _repair_variants(record: dict) -> list[dict]:
-    return list(record["oracle_repair_candidates"])
-
-
 def _repair_prototypes(records: list[dict], module_names: list[str]) -> dict[str, list[dict]]:
     prototypes: dict[str, list[dict]] = {name: [] for name in module_names}
     for record in records:
-        for variant in _repair_variants(record):
+        for variant in record["oracle_repair_candidates"]:
             for name in module_names:
                 prototypes[name].append({
                     "signature": record["drift_signature_vector"].float().cpu(),
@@ -136,7 +132,7 @@ def _classifier_prototypes(records: list[dict]) -> list[dict]:
         "parameter_delta": variant["oracle_classifier_parameter_delta"].float().cpu(),
         "scenario_id": int(record["scenario_id"]),
         "feature_mask": list(variant["feature_mask"]),
-    } for record in records for variant in _repair_variants(record)]
+    } for record in records for variant in record["oracle_repair_candidates"]]
 
 
 def _nearest_prototype(signature: torch.Tensor, candidates: list[dict]) -> dict:
@@ -178,10 +174,11 @@ def _decode_feature_mask(
 ) -> list[int]:
     clipped = probabilities.clamp(1e-7, 1.0 - 1e-7)
     scores = []
+    log_active, log_inactive = torch.log(clipped), torch.log1p(-clipped)
     for candidate in candidates:
         mask = torch.tensor(candidate, dtype=clipped.dtype)
         scores.append(float((
-            mask * torch.log(clipped) + (1.0 - mask) * torch.log1p(-clipped)
+            mask * log_active + (1.0 - mask) * log_inactive
         ).sum().item()))
     return list(candidates[max(range(len(candidates)), key=scores.__getitem__)])
 
@@ -306,12 +303,13 @@ def _build_plan_for_mask(
     magnitudes = state["magnitudes"]
     confidence = state["confidence"]
     feature_mask = normalized_mask
+    mask_key = tuple(feature_mask)
     needs_weight_repair = bool(selected) or feature_mask != bundle.default_feature_mask
     parameter_deltas: dict[str, torch.Tensor] = {}
     selected_prototypes: dict[str, int] = {}
     classifier_candidates = [
         candidate for candidate in bundle.classifier_prototypes
-        if tuple(candidate["feature_mask"]) == tuple(feature_mask)
+        if tuple(candidate["feature_mask"]) == mask_key
     ]
     coherent_candidate = (
         _nearest_prototype(signature, classifier_candidates)
@@ -323,7 +321,7 @@ def _build_plan_for_mask(
     for name in selected:
         candidates = [
             candidate for candidate in bundle.repair_prototypes[name]
-            if tuple(candidate["feature_mask"]) == tuple(feature_mask)
+            if tuple(candidate["feature_mask"]) == mask_key
         ]
         if not candidates:
             raise ValueError(

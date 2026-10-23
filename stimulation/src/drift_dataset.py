@@ -6,8 +6,7 @@ from pathlib import Path
 
 import torch
 
-from .drift import FeatureHistogramDriftDetector
-from .drift_injector import TrafficDriftInjector
+from .drift import FeatureHistogramDriftDetector, TrafficDriftInjector
 from .drift_signature import (
     DRIFT_SIGNATURE_FORMAT_VERSION,
     SIGNATURE_FIELDS,
@@ -484,17 +483,11 @@ def analyze_drift_repair_learnability(dataset: dict) -> dict:
     def similarity_report(selected: list[dict], include_values: bool = False) -> dict:
         signature_similarities: list[float] = []
         repair_similarities: list[float] = []
-        for left, right in itertools.combinations(selected, 2):
-            left_signature = left["drift_signature_vector"].float()
-            right_signature = right["drift_signature_vector"].float()
-            left_repair = torch.cat([
-                *(left["oracle_parameter_deltas"][name].float() for name in module_names),
-                left["oracle_classifier_parameter_delta"].float(),
-            ])
-            right_repair = torch.cat([
-                *(right["oracle_parameter_deltas"][name].float() for name in module_names),
-                right["oracle_classifier_parameter_delta"].float(),
-            ])
+        vectors = [(record["drift_signature_vector"].float(), torch.cat([
+            *(record["oracle_parameter_deltas"][name].float() for name in module_names),
+            record["oracle_classifier_parameter_delta"].float(),
+        ])) for record in selected]
+        for (left_signature, left_repair), (right_signature, right_repair) in itertools.combinations(vectors, 2):
             signature_similarities.append(float(torch.nn.functional.cosine_similarity(
                 left_signature[None], right_signature[None], dim=1, eps=1e-8,
             ).item()))
