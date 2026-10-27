@@ -52,12 +52,12 @@ if [[ "$mode" != "close" ]]; then
 fi
 
 if [[ "$mode" == "implement" || "$mode" == "all" ]]; then
-    verify_status=0
+    implementation_status=0
     "$vivado_bin" -mode batch -nojournal -nolog -notrace \
-        -source "$hardware_root/scripts/verify_u55c.tcl" \
-        -tclargs "$project" "$hardware_root/build/encoded_mlp_v5" || verify_status=$?
+        -source "$hardware_root/scripts/implement_u55c.tcl" \
+        -tclargs "$project" "$hardware_root/build/encoded_mlp_v5" || implementation_status=$?
     if [[ "$mode" == "implement" ]]; then
-        exit "$verify_status"
+        exit "$implementation_status"
     fi
     [[ -s "$routed_dcp" ]] || {
         echo "implementation did not produce a routed checkpoint" >&2

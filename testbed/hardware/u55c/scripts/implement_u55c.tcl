@@ -1,5 +1,5 @@
 if {$argc != 2} {
-    error "usage: verify_u55c.tcl PROJECT REPORT_DIRECTORY"
+    error "usage: implement_u55c.tcl PROJECT REPORT_DIRECTORY"
 }
 set project_path [file normalize [lindex $argv 0]]
 set report_dir [file normalize [lindex $argv 1]]
