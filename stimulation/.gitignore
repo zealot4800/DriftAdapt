@@ -1,9 +1,0 @@
-# Local configuration and generated Python files are covered by the root rules.
-.env
-!.env.example
-__pycache__/
-*.py[cod]
-
-# Generated experiment output and downloaded model checkpoints.
-results/
-checkpoint/

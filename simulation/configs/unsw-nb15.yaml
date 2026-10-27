@@ -1,0 +1,177 @@
+# Explicit source/offline/evaluation partitions; provided order is not verified wall-clock chronology.
+dataset:
+  name: unsw-nb15
+  files:
+  - ../data/unsw-nb15.csv
+  feature_names:
+  - dur
+  - proto
+  - sbytes
+  - dbytes
+  - sttl
+  - dttl
+  - sload
+  - dload
+  - spkts
+  - dpkts
+  - smean
+  - dmean
+  - sinpkt
+  - dinpkt
+  - tcprtt
+  - synack
+  - ackdat
+  - ct_src_ltm
+  - ct_dst_ltm
+  - ct_dst_src_ltm
+  label_column: label
+  num_classes: 2
+  standardize: true
+  normalize: false
+  packet_file: null
+  timestamp_column: null
+timeline:
+  order: provided
+  source_rows: 1000
+  adapter_rows: 1200
+model:
+  class: ID_UNSW_NB15_N3IC
+  kwargs:
+    input_shape: 20
+    neurons:
+    - 32
+    - 16
+    - 2
+  checkpoint: ../results/artifacts/unsw-nb15-student.pt
+labeler:
+  type: ollama
+stream:
+  window_size: 100
+  flow_seconds: 5.0
+training:
+  epochs: 30
+  batch_size: 512
+  learning_rate: 0.01
+  optimizer: Adam
+  balance_binary: true
+drift:
+  bins: 16
+  threshold: 0.1
+  consecutive_windows: 3
+  reference_windows: 10
+drift_injection:
+  enabled: false
+  start_window: 20
+  end_window: null
+  type: abrupt
+  feature_indices:
+  - 0
+  - 1
+  feature_names: []
+  magnitude: 2.0
+trigger:
+  threshold: 0.2
+  drop_threshold: 0.15
+  consecutive_windows: 2
+driftadapt:
+  adapter_checkpoint: ../results/artifacts/unsw-nb15-adapter.pt
+  confidence_threshold: 0.5
+  module_threshold: 0.5
+  signature_shift_clip: 8.0
+  offline:
+    severities:
+    - 0.5
+    - 1.0
+    - 2.0
+    directions:
+    - -1
+    - 1
+    max_feature_pairs: 16
+    oracle_epochs: 10
+    oracle_module_threshold: 0.8
+    hidden_size: 32
+    epochs: 300
+    learning_rate: 0.001
+    validation:
+      minimum_similarity_correlation: 0.3
+      minimum_module_accuracy: 0.7
+      minimum_recovery_ratio: 0.5
+      minimum_oracle_improvement_rate: 0.5
+runtime:
+  device: cpu
+  seed: 42
+  threads: 1
+  parameter_bits: 32
+output:
+  directory: ../results
+siteguard:
+  feedback: null
+  verified_benign_source: false
+  checkpoint: ../results/artifacts/unsw-nb15-siteguard.pt
+  threads: 1
+  features:
+    window_seconds: 5.0
+    sequence_length: 5
+    sampled_sessions: 100
+    session_timeout_seconds: 30.0
+    history_windows: 10
+    zero_baseline_epsilon: 1.0e-06
+    granularities:
+    - dst_ip
+    - dst_port
+    - src_dst_ip
+    - src_sock
+    - dst_sock
+    measurements:
+    - pkts
+    - bytes
+    - ports
+    - src_ips
+    sequence_order:
+    - packet_size
+    - interval_time
+    - jitter
+    - protocol
+    - payload_size
+    tls_enabled: false
+    tls_fields:
+    - tls_has_heartbeat
+    - tls_cipher_suites_cnt
+    - tls_extensions_cnt
+    - tls_has_SNI
+    - tls_sup_heartbeat
+    - cert_self_signed
+    - cert_validity_duration
+    - cert_SNI_in_SAN
+    group_reduction:
+    - sum
+    - sum
+    - max
+    - max
+    short_window_policy: zero_pad_embeddings
+    window_label_policy: any_attack
+  dft:
+    norm: backward
+    frequency_order: paper_one_based
+    c_min: 0
+    c_max: 10
+    clip: true
+  autoencoder:
+    channels: 16
+    residual_blocks: 2
+    latent_dim: 8
+    epochs: 20
+    batch_size: 128
+    learning_rate: 0.001
+  classifier:
+    objective: slack_corrected_linear
+    nu: 0.1
+    tolerance: 0.0001
+    max_iterations: 100000
+  online:
+    beta: 0.1
+    delta: 0.05
+    feedback_window: 100
+    minimum_benign_feedback: 10
+    learning_rate: 0.01
+    schedule: inverse_sqrt
