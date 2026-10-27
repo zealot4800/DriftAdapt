@@ -1,12 +1,9 @@
-# Local environments and secrets
 .env
 .env.*
 !.env.example
 .venv/
 venv/
 env/
-
-# Python-generated files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,8 +15,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
-
-# Editors and operating systems
 .vscode/
 .idea/
 *.swp
@@ -27,8 +22,6 @@ dist/
 *~
 .DS_Store
 Thumbs.db
-
-# Vivado/Xilinx generated state and hardware products
 .Xil/
 *.jou
 *.log
@@ -52,11 +45,7 @@ xsim.dir/
 tight_setup_hold_pins.txt
 usage_statistics_webtalk.*
 webtalk.*
-
-# DriftAdapt U55C outputs are reproducible through build_u55c.sh
 testbed/hardware/u55c/build/
-
-# Runtime output
 testbed/results/
 *.pid
 *.pid.lock
