@@ -1,395 +1,143 @@
 `timescale 1ns/1ps
-
-// Single-packet DRIFTADAPT dataplane. The on-chip source's sixteen signed Q8.8
-// features occupy Ethernet bytes 14..45; prediction/valid are bytes 47/48.
-// Reserved byte 46 is deliberately ignored. Parameters and
-// internal activations use signed Q16.16.
-//
-// One deliberately pipelined 32-bit MAC is shared by all neurons. This costs
-// 672 axis cycles per classified packet, but gives every multiplier and adder
-// an explicit register boundary at the U55C's 250 MHz stream clock.
-module driftadapt_dnn_axis #(
-    parameter WEIGHT_MEM_FILE = "driftadapt_weights.mem"
-) (
-    input  wire          clk,
-    input  wire          rst_n,
-    input  wire          weight_stage_valid_axis,
-    input  wire [7:0]    weight_stage_index_axis,
-    input  wire [31:0]   weight_stage_data_axis,
-    input  wire          weight_clone_request_axis,
-    input  wire          selective_update_mode_axis,
-    input  wire          weight_commit_request_axis,
-    output reg           weight_clone_ack_axis,
-    output reg           weight_clone_busy_axis,
-    output reg           weight_commit_ack_axis,
-    output reg           selective_verify_error_axis,
-    output reg           weights_loaded_axis,
-    output reg           active_weight_bank_axis,
-    output reg  [31:0]   model_version_axis,
-    output reg  [63:0]   classified_packets_axis,
-
-    input  wire [511:0]  s_axis_tdata,
-    input  wire          s_axis_tvalid,
-    output wire          s_axis_tready,
-
-    output wire [511:0]  m_axis_tdata,
-    output wire          m_axis_tvalid,
-    input  wire          m_axis_tready
+// ABI 5: packed evidence LUT + int8 16->16->8->2 MLP, full-image atomic updates.
+module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem") (
+ input wire clk, rst_n,
+ input wire update_begin, stage_valid, commit,
+ input wire [8:0] stage_index, input wire [31:0] stage_data,
+ output reg loaded, updating, output reg [8:0] staged_words,
+ output reg [31:0] model_version, output reg [2:0] errors,
+ input wire [511:0] s_axis_tdata, input wire s_axis_tvalid, output wire s_axis_tready,
+ output wire [511:0] m_axis_tdata, output wire m_axis_tvalid, input wire m_axis_tready
 );
-    localparam integer PARAM_COUNT = 182;
-    localparam [3:0] IDLE = 4'd0, LOAD_OPERANDS = 4'd1,
-                     MULTIPLY = 4'd2, SCALE_PRODUCT = 4'd3,
-                     ACCUMULATE = 4'd4, OUTPUT_PACKET = 4'd5;
-
-    reg [3:0] state;
-    reg [1:0] layer_index;
-    reg [3:0] neuron_index;
-    reg [4:0] feature_index;
-    // Runtime updates are written only to the inactive bank. A commit swaps
-    // banks at an inference boundary, so a packet never observes mixed weights.
-    (* ram_style = "distributed" *) reg signed [31:0] weight_bank0 [0:PARAM_COUNT-1];
-    (* ram_style = "distributed" *) reg signed [31:0] weight_bank1 [0:PARAM_COUNT-1];
-    reg signed [31:0] activation [0:15];
-    reg signed [63:0] accumulator;
-    reg signed [31:0] operand_weight;
-    reg signed [31:0] operand_activation;
-    reg signed [63:0] product;
-    reg signed [63:0] scaled_product;
-    reg signed [63:0] first_logit;
-    reg [511:0] packet_data;
-    reg [7:0] clone_index;
-    reg clone_write_phase;
-    reg signed [31:0] clone_data;
-    reg [7:0] verify_index;
-    reg verify_busy;
-    reg verify_compare_phase;
-    reg signed [31:0] verify_active_data;
-    reg signed [31:0] verify_shadow_data;
-    reg [PARAM_COUNT-1:0] selective_patch_mask;
-    reg verify_mismatch;
-    reg stage_write_pending;
-    reg [7:0] stage_write_index;
-    reg [31:0] stage_write_data;
-    integer index;
-
-    initial begin
-        $readmemh(WEIGHT_MEM_FILE, weight_bank0);
-        $readmemh(WEIGHT_MEM_FILE, weight_bank1);
-    end
-
-    function automatic signed [31:0] active_weight(input integer parameter_index);
-        begin
-            active_weight = active_weight_bank_axis ?
-                            weight_bank1[parameter_index] :
-                            weight_bank0[parameter_index];
-        end
-    endfunction
-
-    function automatic signed [63:0] active_bias(input integer parameter_index);
-        reg signed [31:0] selected_weight;
-        begin
-            selected_weight = active_weight_bank_axis ?
-                              weight_bank1[parameter_index] :
-                              weight_bank0[parameter_index];
-            active_bias = {{32{selected_weight[31]}}, selected_weight};
-        end
-    endfunction
-
-    function automatic signed [31:0] packet_feature_q16(
-        input [511:0] data,
-        input integer feature_number
-    );
-        reg [15:0] network_q8;
-        reg signed [31:0] extended_q8;
-        begin
-            network_q8 = {
-                data[(14 + feature_number*2)*8 +: 8],
-                data[(15 + feature_number*2)*8 +: 8]
-            };
-            extended_q8 = {{16{network_q8[15]}}, network_q8};
-            packet_feature_q16 = extended_q8 <<< 8;
-        end
-    endfunction
-
-    function automatic signed [31:0] saturate_q16(input signed [63:0] value);
-        begin
-            if (value > 64'sh000000007fffffff)
-                saturate_q16 = 32'sh7fffffff;
-            else if (value < -64'sh0000000080000000)
-                saturate_q16 = -32'sh80000000;
-            else
-                saturate_q16 = value[31:0];
-        end
-    endfunction
-
-    function automatic signed [31:0] relu_q16(input signed [63:0] value);
-        begin
-            relu_q16 = value <= 0 ? 32'sd0 : saturate_q16(value);
-        end
-    endfunction
-
-    wire signed [63:0] accumulated_value = accumulator + scaled_product;
-
-    // Do not begin an inference unless the window recorder can eventually
-    // accept it. This keeps per-inference latency separate from agent stalls.
-    assign s_axis_tready = state == IDLE && !weight_clone_request_axis &&
-                           !weight_clone_busy_axis && !weight_commit_request_axis &&
-                           !verify_busy &&
-                           m_axis_tready;
-    assign m_axis_tvalid = state == OUTPUT_PACKET;
-    assign m_axis_tdata = packet_data;
-
-    always @(posedge clk) begin
-        if (!rst_n) begin
-            state <= IDLE;
-            layer_index <= 0;
-            neuron_index <= 0;
-            feature_index <= 0;
-            accumulator <= 0;
-            operand_weight <= 0;
-            operand_activation <= 0;
-            product <= 0;
-            scaled_product <= 0;
-            first_logit <= 0;
-            packet_data <= 0;
-            clone_index <= 0;
-            clone_write_phase <= 1'b0;
-            clone_data <= 0;
-            verify_index <= 0;
-            verify_busy <= 1'b0;
-            verify_compare_phase <= 1'b0;
-            verify_active_data <= 0;
-            verify_shadow_data <= 0;
-            selective_patch_mask <= 0;
-            verify_mismatch <= 1'b0;
-            stage_write_pending <= 1'b0;
-            stage_write_index <= 0;
-            stage_write_data <= 0;
-            weight_clone_ack_axis <= 1'b0;
-            weight_clone_busy_axis <= 1'b0;
-            weight_commit_ack_axis <= 1'b0;
-            selective_verify_error_axis <= 1'b0;
-            weights_loaded_axis <= 1'b1;
-            active_weight_bank_axis <= 1'b0;
-            model_version_axis <= 32'd0;
-            classified_packets_axis <= 0;
-            for (index = 0; index < 16; index = index + 1)
-                activation[index] <= 0;
-        end else begin
-            if (!weight_commit_request_axis)
-                weight_commit_ack_axis <= 1'b0;
-            if (!weight_clone_request_axis)
-                weight_clone_ack_axis <= 1'b0;
-
-            // Register host writes before decoding the distributed weight
-            // banks. This keeps AXI address/control logic off the bank enables.
-            if (stage_write_pending && !weight_clone_busy_axis && !verify_busy) begin
-                if (active_weight_bank_axis)
-                    weight_bank0[stage_write_index] <= stage_write_data;
-                else
-                    weight_bank1[stage_write_index] <= stage_write_data;
-                if (selective_update_mode_axis)
-                    selective_patch_mask[stage_write_index] <= 1'b1;
-                stage_write_pending <= 1'b0;
-            end else if (weight_stage_valid_axis &&
-                         weight_stage_index_axis < PARAM_COUNT &&
-                         !weight_clone_busy_axis && !verify_busy) begin
-                stage_write_pending <= 1'b1;
-                stage_write_index <= weight_stage_index_axis;
-                stage_write_data <= weight_stage_data_axis;
-            end
-
-            if (state == IDLE && weight_clone_request_axis &&
-                !weight_clone_ack_axis && !weight_clone_busy_axis && !verify_busy &&
-                !stage_write_pending && !weight_stage_valid_axis) begin
-                weight_clone_busy_axis <= 1'b1;
-                clone_index <= 0;
-                clone_write_phase <= 1'b0;
-                selective_patch_mask <= 0;
-                selective_verify_error_axis <= 1'b0;
-            end else if (weight_clone_busy_axis) begin
-                // Split the clone into registered read and write phases so
-                // no dynamic bank-to-bank path spans a single 250 MHz cycle.
-                if (!clone_write_phase) begin
-                    clone_data <= active_weight_bank_axis ?
-                                  weight_bank1[clone_index] :
-                                  weight_bank0[clone_index];
-                    clone_write_phase <= 1'b1;
-                end else begin
-                    if (active_weight_bank_axis)
-                        weight_bank0[clone_index] <= clone_data;
-                    else
-                        weight_bank1[clone_index] <= clone_data;
-                    clone_write_phase <= 1'b0;
-                    if (clone_index == PARAM_COUNT - 1) begin
-                        weight_clone_busy_axis <= 1'b0;
-                        weight_clone_ack_axis <= 1'b1;
-                    end else begin
-                        clone_index <= clone_index + 1'b1;
-                    end
-                end
-            end
-
-            if (state == IDLE && weight_commit_request_axis &&
-                !weight_commit_ack_axis && !weight_clone_busy_axis && !verify_busy &&
-                !stage_write_pending && !weight_stage_valid_axis) begin
-                if (selective_update_mode_axis) begin
-                    verify_busy <= 1'b1;
-                    verify_index <= 0;
-                    verify_compare_phase <= 1'b0;
-                    verify_mismatch <= 1'b0;
-                    selective_verify_error_axis <= 1'b0;
-                end else begin
-                    selective_verify_error_axis <= 1'b0;
-                    active_weight_bank_axis <= ~active_weight_bank_axis;
-                    model_version_axis <= model_version_axis + 1'b1;
-                    weight_commit_ack_axis <= 1'b1;
-                    weights_loaded_axis <= 1'b1;
-                end
-            end else if (verify_busy) begin
-                // As with clone, register both bank reads before comparing.
-                // Patched words are ignored; every unpatched word must match.
-                if (!verify_compare_phase) begin
-                    verify_active_data <= active_weight_bank_axis ?
-                                          weight_bank1[verify_index] :
-                                          weight_bank0[verify_index];
-                    verify_shadow_data <= active_weight_bank_axis ?
-                                          weight_bank0[verify_index] :
-                                          weight_bank1[verify_index];
-                    verify_compare_phase <= 1'b1;
-                end else begin
-                    if (!selective_patch_mask[verify_index] &&
-                        verify_active_data != verify_shadow_data)
-                        verify_mismatch <= 1'b1;
-
-                    verify_compare_phase <= 1'b0;
-                    if (verify_index == PARAM_COUNT - 1) begin
-                        verify_busy <= 1'b0;
-                        weight_commit_ack_axis <= 1'b1;
-                        if (verify_mismatch ||
-                            (!selective_patch_mask[verify_index] &&
-                             verify_active_data != verify_shadow_data)) begin
-                            selective_verify_error_axis <= 1'b1;
-                        end else begin
-                            active_weight_bank_axis <= ~active_weight_bank_axis;
-                            model_version_axis <= model_version_axis + 1'b1;
-                            weights_loaded_axis <= 1'b1;
-                        end
-                    end else begin
-                        verify_index <= verify_index + 1'b1;
-                    end
-                end
-            end
-
-            case (state)
-                IDLE: begin
-                    if (s_axis_tvalid && s_axis_tready) begin
-                        packet_data <= s_axis_tdata;
-                        for (index = 0; index < 16; index = index + 1)
-                            activation[index] <= packet_feature_q16(s_axis_tdata, index);
-                        layer_index <= 0;
-                        neuron_index <= 0;
-                        feature_index <= 0;
-                        accumulator <= active_bias(128);
-                        state <= LOAD_OPERANDS;
-                    end
-                end
-
-                LOAD_OPERANDS: begin
-                    operand_activation <= activation[feature_index];
-                    case (layer_index)
-                        0: operand_weight <= active_weight(neuron_index*16 + feature_index);
-                        1: operand_weight <= active_weight(136 + neuron_index*8 + feature_index);
-                        default: operand_weight <= active_weight(172 + neuron_index*4 + feature_index);
-                    endcase
-                    state <= MULTIPLY;
-                end
-
-                MULTIPLY: begin
-                    product <= operand_weight * operand_activation;
-                    state <= SCALE_PRODUCT;
-                end
-
-                SCALE_PRODUCT: begin
-                    scaled_product <= product >>> 16;
-                    state <= ACCUMULATE;
-                end
-
-                ACCUMULATE: begin
-                    case (layer_index)
-                        0: begin
-                            if (feature_index == 15) begin
-                                activation[neuron_index] <= relu_q16(accumulated_value);
-                                feature_index <= 0;
-                                if (neuron_index == 7) begin
-                                    layer_index <= 1;
-                                    neuron_index <= 0;
-                                    accumulator <= active_bias(168);
-                                end else begin
-                                    neuron_index <= neuron_index + 1'b1;
-                                    accumulator <= active_bias(129+neuron_index);
-                                end
-                            end else begin
-                                feature_index <= feature_index + 1'b1;
-                                accumulator <= accumulated_value;
-                            end
-                            state <= LOAD_OPERANDS;
-                        end
-
-                        1: begin
-                            if (feature_index == 7) begin
-                                activation[neuron_index] <= relu_q16(accumulated_value);
-                                feature_index <= 0;
-                                if (neuron_index == 3) begin
-                                    layer_index <= 2;
-                                    neuron_index <= 0;
-                                    accumulator <= active_bias(180);
-                                end else begin
-                                    neuron_index <= neuron_index + 1'b1;
-                                    accumulator <= active_bias(169+neuron_index);
-                                end
-                            end else begin
-                                feature_index <= feature_index + 1'b1;
-                                accumulator <= accumulated_value;
-                            end
-                            state <= LOAD_OPERANDS;
-                        end
-
-                        default: begin
-                            if (feature_index == 3) begin
-                                feature_index <= 0;
-                                if (neuron_index == 0) begin
-                                    first_logit <= accumulated_value;
-                                    neuron_index <= 1;
-                                    accumulator <= active_bias(181);
-                                    state <= LOAD_OPERANDS;
-                                end else begin
-                                    packet_data[47*8 +: 8] <=
-                                        first_logit >= accumulated_value ? 8'd0 : 8'd1;
-                                    packet_data[49*8 +: 32] <= saturate_q16(
-                                        first_logit >= accumulated_value ?
-                                        first_logit - accumulated_value :
-                                        accumulated_value - first_logit
-                                    );
-                                    classified_packets_axis <= classified_packets_axis + 1'b1;
-                                    state <= OUTPUT_PACKET;
-                                end
-                            end else begin
-                                feature_index <= feature_index + 1'b1;
-                                accumulator <= accumulated_value;
-                                state <= LOAD_OPERANDS;
-                            end
-                        end
-                    endcase
-                end
-
-                OUTPUT_PACKET: begin
-                    if (m_axis_tready)
-                        state <= IDLE;
-                end
-
-                default: state <= IDLE;
-            endcase
-        end
-    end
+ localparam BOOT=0, IDLE=1, ENCODE=2, BEGIN_NEURON=3, OPERANDS=4,
+            MAC=5, STORE=6, COPY=7, OUTPUT_PACKET=8,
+            QSUM=9, QFULL=10, QROUND=11, ACTIVATE=12;
+ reg [3:0] state;
+ reg [31:0] rom[0:384];
+ reg [31:0] bank0[0:384], bank1[0:384];
+ reg active, pending;
+ reg [384:0] written;
+ reg [8:0] boot_index;
+ reg [4:0] feature_index,neuron,copy_index;
+ reg [1:0] layer;
+ reg signed [8:0] activation[0:15];
+ reg [7:0] next_activation[0:15];
+ reg signed [8:0] operand_a;
+ reg signed [7:0] operand_w;
+ reg [31:0] requant_multiplier,p00,p01,p10,p11;
+ reg [63:0] qlo,qhi,qproduct,scaled;
+ reg signed [63:0] accumulator, first_logit;
+ reg [511:0] packet;
+ wire [4:0] nin=layer==2 ? 8 : 16;
+ wire [4:0] nout=layer==0 ? 16 : (layer==1 ? 8 : 2);
+ wire [10:0] weight_offset=layer==0 ? 1024 : (layer==1 ? 1280 : 1408);
+ wire [8:0] bias_offset=layer==0 ? 356 : (layer==1 ? 372 : 380);
+ wire [10:0] lut_index=feature_index*64+packet[(14+feature_index)*8 +: 8];
+ wire [10:0] weight_index=weight_offset+(layer==2 ? neuron*8 : neuron*16)+feature_index;
+ wire [31:0] lut_word=active ? bank1[lut_index/4] : bank0[lut_index/4];
+ wire [31:0] weight_word=active ? bank1[weight_index/4] : bank0[weight_index/4];
+ wire signed [7:0] lut_byte=lut_word[(lut_index%4)*8 +: 8];
+ wire signed [7:0] weight_byte=weight_word[(weight_index%4)*8 +: 8];
+ wire signed [31:0] bias_word=active ? bank1[bias_offset+neuron] : bank0[bias_offset+neuron];
+ wire [31:0] multiplier_word=active ? bank1[382+layer] : bank0[382+layer];
+ wire signed [31:0] threshold_word=active ? bank1[384] : bank0[384];
+ wire signed [63:0] margin=accumulator-first_logit;
+ initial $readmemh(WEIGHT_MEM_FILE, rom);
+ assign s_axis_tready=loaded && state==IDLE && !updating && !pending && !update_begin && !commit;
+ assign m_axis_tvalid=state==OUTPUT_PACKET;
+ assign m_axis_tdata=packet;
+ always @(posedge clk) begin
+   if(!rst_n) begin
+     state<=BOOT; boot_index<=0; loaded<=0; active<=0; pending<=0;
+     updating<=0; written<=0; staged_words<=0; model_version<=0; errors<=0;
+     packet<=0; layer<=0; feature_index<=0; neuron<=0; copy_index<=0;
+     accumulator<=0; first_logit<=0; operand_a<=0; operand_w<=0;
+     requant_multiplier<=0;p00<=0;p01<=0;p10<=0;p11<=0;qlo<=0;qhi<=0;qproduct<=0;scaled<=0;
+   end else begin
+     if(update_begin && loaded && !updating && !pending) begin
+       updating<=1; written<=0; staged_words<=0; errors[0]<=0;
+     end
+     if(stage_valid) begin
+       if(updating && !pending && stage_index<385) begin
+         if(active) bank0[stage_index]<=stage_data; else bank1[stage_index]<=stage_data;
+         if(!written[stage_index]) staged_words<=staged_words+1'b1;
+         written[stage_index]<=1;
+       end else errors[0]<=1;
+     end
+     if(commit) begin
+       if(updating && &written && !errors[0]) pending<=1;
+       else begin errors[0]<=1; updating<=0; end
+     end
+     case(state)
+       BOOT: begin
+         bank0[boot_index]<=rom[boot_index]; bank1[boot_index]<=rom[boot_index];
+         if(boot_index==384) begin loaded<=1; state<=IDLE; end
+         else boot_index<=boot_index+1;
+       end
+       IDLE: begin
+         if(pending) begin
+           active<=!active; model_version<=model_version+1; pending<=0; updating<=0;
+         end else if(s_axis_tvalid && s_axis_tready) begin
+           packet<=s_axis_tdata; packet[53*8 +: 32]<=model_version;
+           feature_index<=0; layer<=0; state<=ENCODE;
+         end
+       end
+       ENCODE: begin
+         activation[feature_index]<=lut_byte;
+         if(packet[(14+feature_index)*8 +: 8]>63) errors[1]<=1;
+         if(feature_index==15) begin neuron<=0; state<=BEGIN_NEURON; end
+         else feature_index<=feature_index+1;
+       end
+       BEGIN_NEURON: begin
+         accumulator<=bias_word; feature_index<=0; state<=OPERANDS;
+         requant_multiplier<=multiplier_word;
+       end
+       OPERANDS: begin
+         operand_a<=activation[feature_index];
+         operand_w<=weight_byte; state<=MAC;
+       end
+       MAC: begin
+         accumulator<=accumulator+operand_a*operand_w;
+         if(feature_index==nin-1) state<=STORE;
+         else begin feature_index<=feature_index+1; state<=OPERANDS; end
+       end
+       STORE: begin
+         if(accumulator < -64'sd2147483648 || accumulator > 64'sd2147483647) errors[2]<=1;
+         if(layer<2) begin
+           // Four registered 16x16 products avoid a wide unpipelined multiplier.
+           p00<=accumulator>0 ? accumulator[15:0]*requant_multiplier[15:0] : 0;
+           p01<=accumulator>0 ? accumulator[15:0]*requant_multiplier[31:16] : 0;
+           p10<=accumulator>0 ? accumulator[31:16]*requant_multiplier[15:0] : 0;
+           p11<=accumulator>0 ? accumulator[31:16]*requant_multiplier[31:16] : 0;
+           state<=QSUM;
+         end else if(neuron==0) begin
+           first_logit<=accumulator; neuron<=1; state<=BEGIN_NEURON;
+         end else begin
+           if(margin < -64'sd2147483648 || margin > 64'sd2147483647) errors[2]<=1;
+           packet[47*8 +: 8]<=margin >= threshold_word ? 8'd1 : 8'd0;
+           packet[48*8 +: 8]<=8'd1;
+           packet[49*8 +: 32]<=margin[31:0]; state<=OUTPUT_PACKET;
+         end
+       end
+       QSUM: begin
+         qlo<={32'd0,p00}+({32'd0,p01}<<16);
+         qhi<=({32'd0,p10}<<16)+({32'd0,p11}<<32);state<=QFULL;
+       end
+       QFULL: begin qproduct<=qlo+qhi;state<=QROUND;end
+       QROUND: begin scaled<=(qproduct+64'd8388608)>>24;state<=ACTIVATE;end
+       ACTIVATE: begin
+         next_activation[neuron]<=scaled>255 ? 8'd255 : scaled[7:0];
+         if(neuron==nout-1) begin copy_index<=0;state<=COPY;end
+         else begin neuron<=neuron+1;state<=BEGIN_NEURON;end
+       end
+       COPY: begin
+         activation[copy_index]<=$signed({1'b0,next_activation[copy_index]});
+         if(copy_index==nout-1) begin layer<=layer+1; neuron<=0; state<=BEGIN_NEURON; end
+         else copy_index<=copy_index+1;
+       end
+       OUTPUT_PACKET: if(m_axis_tready) state<=IDLE;
+       default: state<=BOOT;
+     endcase
+   end
+ end
 endmodule

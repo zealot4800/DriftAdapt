@@ -1,7 +1,8 @@
 set plugin_root [file dirname [file normalize [info script]]]
 set hardware_root [file normalize [file join $plugin_root ..]]
 
-foreach memory_file {driftadapt_weights.mem driftadapt_samples.mem} {
+set_property include_dirs [concat [get_property include_dirs [current_fileset]] [list [file join $hardware_root assets]]] [current_fileset]
+foreach memory_file {driftadapt_weights.mem driftadapt_samples.mem driftadapt_reference.mem} {
     set memory_path [file join $hardware_root assets $memory_file]
     if {![file exists $memory_path]} { error "Missing DRIFTADAPT memory image: $memory_path" }
     add_files -fileset sources_1 -norecurse $memory_path
@@ -24,7 +25,6 @@ if {[llength [get_runs -quiet driftadapt_jtag_axi_synth_1]] == 0} {
 launch_runs driftadapt_jtag_axi_synth_1
 wait_on_run driftadapt_jtag_axi_synth_1
 
-read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_benchmark_metrics.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_control_regs.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_dnn_axis.sv]
 read_verilog -quiet -sv [file join $hardware_root rtl driftadapt_hist_monitor.sv]

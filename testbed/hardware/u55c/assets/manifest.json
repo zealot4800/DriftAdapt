@@ -1,21 +1,39 @@
 {
-  "format_version": 2,
-  "sample_count": 16000,
-  "feature_count": 16,
-  "parameter_count": 182,
-  "feature_format": "signed Q8.8",
-  "sample_record": "sixteen features; no label",
-  "parameter_format": "signed Q16.16",
-  "checkpoint_sha256": "a34e8dd4f0ff1a46ddaf5e651095616a55cce46704ce62b24657b41f8290ce97",
-  "config_sha256": "40dce7f37cbc3dedbc9d7d46814a9a15bd41d0826169314aa34a9f5b6a253dc5",
-  "weights_sha256": "790c5571b342a119e8a6d644656f7118d1047d04e21842361301482cb38fc1fd",
-  "samples_sha256": "826ce265ba6e4ec81a07df104e0c0128935b82594b5f39f08d27b344adb4d24b",
+  "abi": 327680,
+  "architecture": "distilled_evidence_quantized_mlp_v4",
+  "layers": [
+    16,
+    16,
+    8,
+    2
+  ],
+  "model_words": 385,
+  "model_payload_bytes": 1540,
+  "inference_parameter_bytes": 1668,
+  "sample_count": 13800,
+  "window_size": 100,
+  "preprocessing_id": "0509b863318b09d9f9b7060357fd122a465af613ac4255d952c0e9b8efd8e2f2",
+  "drift": {
+    "bins": 16,
+    "threshold": 0.1,
+    "consecutive_windows": 3,
+    "reference_windows": 10
+  },
+  "build_id": 268577527,
+  "checkpoint": "/home/zealot/DriftAdapt/simulation/results/artifacts/cic-ids2017-driftadapt-mlp-v4.pt",
+  "checkpoint_sha256": "5ebac3a0f0d823890af0ff337cb8d6ccbbc0dbd7d34133e22fdb1b469596a247",
+  "config": "/home/zealot/DriftAdapt/simulation/configs/cic-ids2017.yaml",
+  "files": {
+    "driftadapt_weights.mem": "0e21c3d3169f8ebde9cdbf9715a71bd6edea3359a635761bce073aa498e4858d",
+    "driftadapt_samples.mem": "6ea6136ecff3b476901deaee2f13a4effd5d742fe6f330e23eb4c0d67d82d0d1",
+    "driftadapt_reference.mem": "7152bd4ebb95e3f986a49e973793314279ad328bcc437d28ed52506bf0838726",
+    "driftadapt_config.vh": "913a870632559d68da6c7442eddf606b0c68d4a90e4603081794611721d4317d"
+  },
+  "input_representation": "16 uint8 encoder bin IDs, 0..63; host source-only preprocessing",
   "expected": {
-    "true_positive": 5848,
-    "true_negative": 882,
-    "false_positive": 7118,
-    "false_negative": 2152,
-    "correct": 6730,
-    "accuracy": 0.420625
+    "true_positive": 5650,
+    "true_negative": 6014,
+    "false_positive": 880,
+    "false_negative": 1256
   }
 }

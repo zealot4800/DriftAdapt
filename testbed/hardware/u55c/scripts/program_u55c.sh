@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 hardware_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-bitstream=${DRIFTADAPT_U55C_BITSTREAM:-$hardware_root/build/closure/driftadapt_u55c_timing_closed.bit}
-report_dir=${DRIFTADAPT_U55C_REPORT_DIR:-$hardware_root/build/closure}
+bitstream=${DRIFTADAPT_U55C_BITSTREAM:-$hardware_root/build/encoded_mlp_v5/closure/driftadapt_u55c_timing_closed.bit}
+report_dir=${DRIFTADAPT_U55C_REPORT_DIR:-$hardware_root/build/encoded_mlp_v5/closure}
 vivado_bin=${VIVADO_BIN:-/home/palhad/Xilinx/Vivado/2022.2/bin/vivado}
 program_tcl=${DRIFTADAPT_PROGRAM_TCL:-/home/zealot/FTC/scripts/program_fpga1_jtag.tcl}
 assume_yes=0
@@ -14,8 +14,8 @@ usage() {
 Usage: $(basename "$0") [--bitstream FILE] [--yes] [--dry-run]
 
 Programs the DRIFTADAPT online-window image over JTAG. Traffic inference and
-window capture run in FPGA fabric; the host exchanges either CARAVAN labels or
-label-free DriftAdapt statistics through private JTAG AXI. This command does not load a driver,
+window capture run in FPGA fabric; the host applies verified feedback updates
+through the private JTAG AXI control path. This command does not load a driver,
 configure QDMA/CMAC, create Linux interfaces, or use an optical cable.
 EOF
 }
@@ -46,7 +46,7 @@ while IFS= read -r design_source; do
     [[ "$bitstream" -nt "$design_source" ]] ||
         die "bitstream is stale relative to $design_source; run build_u55c.sh all"
 done < <(find "$hardware_root/rtl" "$hardware_root/plugin" "$hardware_root/assets" \
-    -type f \( -name '*.sv' -o -name '*.tcl' -o -name '*.mem' -o -name '*.json' \) \
+    -type f \( -name '*.sv' -o -name '*.tcl' -o -name '*.mem' -o -name '*.json' -o -name '*.vh' \) \
     -print)
 for report in timing.txt route_status.txt drc.txt; do
     [[ -s "$report_dir/$report" ]] ||
@@ -77,7 +77,7 @@ bitstream=$(readlink -f "$bitstream")
 echo "Bitstream: $bitstream"
 echo "SHA-256:   $(sha256sum "$bitstream" | awk '{print $1}')"
 echo "Reports:   $report_dir"
-echo "Mode:      FPGA inference with CARAVAN/DriftAdapt window exchange"
+echo "Mode:      Encoded MLP inference with verified-feedback model updates"
 
 if ((dry_run)); then
     echo "DRIFTADAPT_U55C_ONLINE_DRY_RUN=PASS"
@@ -100,4 +100,4 @@ env -u LD_LIBRARY_PATH -u PYTHONPATH \
 echo
 echo "DRIFTADAPT_U55C_ONLINE_PROGRAM=PASS"
 echo "The FPGA now fills two windows and waits for the host controller."
-echo "Run hardware/u55c/scripts/run_online_adaptation.py in caravan or drift_conditioned mode."
+echo "Run simulation/.venv/bin/python testbed/hardware/u55c/scripts/run_online_adaptation.py --backend jtag"
