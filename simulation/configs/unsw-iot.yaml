@@ -1,6 +1,7 @@
 # Explicit source/offline/evaluation partitions; provided order is not verified wall-clock chronology.
 dataset:
   name: unsw-iot
+  task: device_classification
   files:
   - ../data/unsw-iot.csv
   feature_names:
@@ -71,6 +72,7 @@ trigger:
   drop_threshold: 0.15
   consecutive_windows: 2
 driftadapt:
+  task: multiclass
   adapter_checkpoint: ../results/artifacts/unsw-iot-adapter.pt
   confidence_threshold: 0.5
   module_threshold: 0.5

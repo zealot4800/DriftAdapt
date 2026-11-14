@@ -32,11 +32,11 @@ class EvidenceDistillationLoss(nn.Module):
 
 
 class CompactMLP(nn.Module):
-    def __init__(self, input_bound):
+    def __init__(self, input_bound, num_classes=2):
         super().__init__()
         self.register_buffer('input_bound', torch.as_tensor(input_bound, dtype=torch.float32))
         self.register_buffer('hidden_scales', torch.ones(2))
-        sizes = (len(input_bound), 16, 8, 2)
+        sizes = (len(input_bound), 16, 8, num_classes)
         self.layers = nn.ModuleList(nn.Linear(left, right) for left, right in zip(sizes, sizes[1:]))
         self.qat = False
 
@@ -76,7 +76,13 @@ class DriftAdapt:
 
     def __init__(self, config, output):
         self.config = config
-        self.benign = benign_classes(config, required=True)
+        task = config.get('driftadapt', {}).get('task', 'anomaly')
+        if task not in ('anomaly', 'multiclass'):
+            raise ValueError('driftadapt.task must be anomaly or multiclass')
+        self.multiclass = task == 'multiclass'
+        self.num_classes = config['dataset']['num_classes'] if self.multiclass else 2
+        self.evaluation_target = 'original_class_id' if self.multiclass else 'anomaly'
+        self.benign = None if self.multiclass else benign_classes(config, required=True)
         self.max_fpr = float(config.get('driftadapt', {}).get('max_false_positive_rate', 0.15))
         if not 0 <= self.max_fpr <= 1:
             raise ValueError('driftadapt.max_false_positive_rate must be between zero and one')
@@ -84,6 +90,9 @@ class DriftAdapt:
         self.distillation_weight = 0.0
         self.checkpoint = (path_for(config, config['output']['directory']) / 'artifacts'
                            / f"{config['dataset']['name']}-driftadapt-mlp-v4.pt")
+        if self.multiclass:
+            self.architecture = 'multiclass_histogram_quantized_mlp_v1'
+            self.checkpoint = self.checkpoint.with_name(f"{config['dataset']['name']}-driftadapt-multiclass-v1.pt")
         self.pending = {}
         self.feedback = deque(maxlen=2048)
         self.version = self.update_bytes = self.feedback_count = self.new_feedback = self.streak = 0
@@ -92,9 +101,15 @@ class DriftAdapt:
         return {'architecture': self.architecture, 'preprocessing_id': data.preprocessing_id,
                 'offline_sha256': frame_fingerprint(data.frames[1]), 'benign_classes': self.benign,
                 'seed': self.config['runtime']['seed'], 'training': dict(self.config['training']),
-                'max_false_positive_rate': self.max_fpr, 'encoder_bins': self.encoder_bins}
+                'max_false_positive_rate': self.max_fpr, 'encoder_bins': self.encoder_bins,
+                **({'num_classes': self.num_classes} if self.multiclass else {})}
 
     def _labels(self, labels):
+        if self.multiclass:
+            labels = np.asarray(labels, dtype=np.int64)
+            if np.any((labels < 0) | (labels >= self.num_classes)):
+                raise ValueError('Multiclass labels must be in [0, num_classes)')
+            return labels
         return (~np.isin(labels, self.benign)).astype(np.int64)
 
     def _indices(self, features):
@@ -108,17 +123,25 @@ class DriftAdapt:
                            minlength=indices.shape[1] * bins).reshape(-1, bins)
 
     def _encoder_indices(self, features):
-        return np.clip(np.floor((features - self.encoder_minimum) * self.encoder_inverse_width),
-                       0, self.encoder_bins - 1).astype(np.int64)
+        indices = np.clip(np.floor((features - self.encoder_minimum) * self.encoder_inverse_width),
+                          0, self.encoder_bins - 1).astype(np.int64)
+        return np.repeat(indices, self.num_classes, axis=1) if self.multiclass else indices
 
     def _encode(self, features):
-        return self.encoder_table[np.arange(features.shape[1]), self._encoder_indices(features)]
+        return self.encoder_table[np.arange(len(self.encoder_table)), self._encoder_indices(features)]
 
     def _fit_encoder(self, features, labels):
         self.encoder_minimum = features.min(axis=0)
         span = np.ptp(features, axis=0)
         self.encoder_inverse_width = self.encoder_bins / np.where(span > 0, span, 1)
-        indices = self._encoder_indices(features)
+        indices = np.clip(np.floor((features - self.encoder_minimum) * self.encoder_inverse_width),
+                          0, self.encoder_bins - 1).astype(np.int64)
+        if self.multiclass:
+            counts = np.stack([self._counts(indices[labels == label], self.encoder_bins)
+                               for label in range(self.num_classes)])
+            probability = (counts + 1) / (counts.sum(axis=2, keepdims=True) + self.encoder_bins)
+            self.encoder_table = np.log(probability).transpose(1, 0, 2).reshape(-1, self.encoder_bins).astype(np.float32)
+            return
         counts = np.stack([self._counts(indices[labels == label], self.encoder_bins) for label in (0, 1)])
         probability = (counts + 1) / (counts.sum(axis=2, keepdims=True) + self.encoder_bins)
         self.encoder_table = np.log(probability[1] / probability[0]).astype(np.float32)
@@ -150,7 +173,7 @@ class DriftAdapt:
         self.macs = sum(w.size for w, _, _ in self.packed)
 
     def _scores(self, features):
-        x = self.input_table[np.arange(features.shape[1]), self._encoder_indices(features)].astype(np.int32)
+        x = self.input_table[np.arange(len(self.encoder_table)), self._encoder_indices(features)].astype(np.int32)
         for index, (weight, bias, multiplier) in enumerate(self.packed):
             x = x @ weight.astype(np.int64).T + bias
             if np.any((x < -(2**31)) | (x >= 2**31)):
@@ -158,12 +181,16 @@ class DriftAdapt:
             if index < 2:
                 x = np.clip((x.clip(0) * multiplier + (1 << (self.requant_shift - 1)))
                             >> self.requant_shift, 0, 255).astype(np.int32)
+        if self.multiclass:
+            return x
         margin = x[:, 1] - x[:, 0]
         if np.any((margin < -(2**31)) | (margin >= 2**31 - 1)):
             raise ValueError('MLP decision margin exceeds the signed 32-bit export range')
         return margin.astype(np.int32)
 
     def _threshold(self, scores, labels):
+        if self.multiclass:
+            return None
         order = np.argsort(scores, kind='stable')
         values = np.unique(scores)
         thresholds = np.r_[values, values[-1] + 1]
@@ -196,14 +223,14 @@ class DriftAdapt:
         return retrain_model(self.model, encoded, labels, epochs=epochs,
             batch_size=settings['batch_size'], learning_rate=settings['learning_rate'],
             optimizer_name=settings['optimizer'], optimizer=optimizer,
-            class_weights=torch.tensor([self.benign_cost, 1.0], device=encoded.device),
+            class_weights=(None if self.multiclass else torch.tensor([self.benign_cost, 1.0], device=encoded.device)),
             criterion=criterion)[1]
 
     def _load(self, data):
         saved = torch.load(self.checkpoint, map_location=data.device, weights_only=True)
         if saved['schema'] != self._schema(data):
             raise ValueError('MLP checkpoint source, offline partition, or training settings differ from runtime')
-        self.model = CompactMLP(torch.ones(len(data.feature_names))).to(data.device)
+        self.model = CompactMLP(torch.ones(len(data.feature_names) * (self.num_classes if self.multiclass else 1)), self.num_classes).to(data.device)
         self.model.load_state_dict(saved['state_dict'])
         self.encoder_minimum = saved['encoder_minimum'].cpu().numpy()
         self.encoder_inverse_width = saved['encoder_inverse_width'].cpu().numpy()
@@ -219,6 +246,8 @@ class DriftAdapt:
     def train(self, data):
         if self.checkpoint.exists():
             return dict(self._load(data), reused_checkpoint=str(self.checkpoint))
+        if self.multiclass:
+            return self._train_multiclass(data)
         source = data.features[0]
         labels = self._labels(data.labels[0].cpu().numpy())
         source_labels = torch.as_tensor(labels, device=data.device)
@@ -303,6 +332,45 @@ class DriftAdapt:
                     'encoder_table': torch.from_numpy(self.encoder_table)}, self.checkpoint)
         return report
 
+    def _train_multiclass(self, data):
+        source = data.features[0].cpu().numpy()
+        labels = self._labels(data.labels[0].cpu().numpy())
+        target = self._labels(data.labels[1].cpu().numpy())
+        cut = len(target) // 2
+        if len(np.unique(labels)) < 2 or cut == 0 or cut == len(target):
+            raise ValueError('Multiclass training needs at least two source classes and two nonempty offline halves')
+        self._fit_encoder(source, labels)
+        bound = np.maximum(np.abs(self.encoder_table).max(axis=1), 1e-6)
+        self.model = CompactMLP(bound, self.num_classes).to(data.device)
+        encoded = torch.as_tensor(self._encode(source), device=data.device)
+        source_labels = torch.as_tensor(labels, device=data.device)
+        epochs = int(self.config['training']['epochs'])
+        if epochs < 1:
+            raise ValueError('MLP training epochs must be positive')
+        self._fit(encoded, source_labels, epochs, distill=False)
+        self.model.calibrate_activations(encoded)
+        self.model.qat = True
+        self._fit(encoded, source_labels, epochs, distill=False)
+        self.model.eval()
+        self.threshold = None
+        self._export()
+        prediction = self._scores(data.features[1].cpu().numpy()).argmax(axis=1)
+        report = {'architecture': self.architecture, 'task': 'device_classification',
+                  'layers': [len(bound), 16, 8, self.num_classes],
+                  'source_training_samples': len(labels), 'offline_validation_samples': len(target),
+                  'unseen_source_classes': sorted(set(range(self.num_classes)) - set(map(int, labels))),
+                  'epochs': epochs, 'qat_epochs': epochs,
+                  'benign_loss_weight': 1.0, 'distillation_weight': 0.0,
+                  'encoder': 'source_class_histogram_log_probability',
+                  'validation_macro_f1': macro_f1(torch.as_tensor(target), torch.as_tensor(prediction))}
+        self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({'schema': self._schema(data), 'state_dict': self.model.state_dict(),
+                    'threshold': None, 'training': report,
+                    'encoder_minimum': torch.from_numpy(self.encoder_minimum),
+                    'encoder_inverse_width': torch.from_numpy(self.encoder_inverse_width),
+                    'encoder_table': torch.from_numpy(self.encoder_table)}, self.checkpoint)
+        return report
+
     def prepare(self, data):
         self._load(data)
         source = data.features[0].cpu().numpy()
@@ -321,7 +389,8 @@ class DriftAdapt:
 
     def infer(self, observation):
         self.features = observation['features'].cpu().numpy()
-        return (self._scores(self.features) >= self.threshold).astype(np.int64)
+        scores = self._scores(self.features)
+        return scores.argmax(axis=1) if self.multiclass else (scores >= self.threshold).astype(np.int64)
 
     def adapt(self, observation, prediction):
         current = self._counts(self._indices(self.features), self.bins)
@@ -335,7 +404,7 @@ class DriftAdapt:
             if sample_id in observation['feedback_sample_ids']:
                 self.pending[sample_id] = self.features[offset].copy()
         for record in observation['feedback']:
-            self.feedback.append((self.pending.pop(record['sample_id']), int(record['label'] not in self.benign)))
+            self.feedback.append((self.pending.pop(record['sample_id']), int(self._labels([record['label']])[0])))
         released = len(observation['feedback'])
         self.feedback_count += released
         self.new_feedback += released
@@ -360,13 +429,15 @@ class DriftAdapt:
     def state(self):
         return {'architecture': self.architecture, 'adaptation_count': self.version,
                 'labeling_cost_samples': self.feedback_count, 'labeling_seconds': None,
-                'model_update_bytes': self.update_bytes, 'layers': [len(self.encoder_table), 16, 8, 2],
+                'model_update_bytes': self.update_bytes, 'layers': [len(self.encoder_table), 16, 8, self.num_classes],
                 'weight_bits': 8, 'bias_bits': 32, 'activation_bits': 8,
                 'score_accumulator_bits': 32, 'requantization_intermediate_bits': 64,
                 'inference_parameter_bytes': self.parameter_bytes,
                 'multiply_accumulates_per_flow': self.macs,
-                'input_encoding': 'source_class_histogram_log_ratio',
+                'evaluation_target': self.evaluation_target,
+                'input_encoding': 'source_class_histogram_log_probability' if self.multiclass else 'source_class_histogram_log_ratio',
                 'encoder_bins': self.encoder_bins, 'encoder_table_bytes': self.input_table.nbytes,
                 'distillation_weight': self.distillation_weight,
                 'decision_threshold': self.threshold, 'histogram_bins': self.bins,
-                'calibration_fpr_target': self.max_fpr, 'benign_loss_weight': self.benign_cost}
+                'calibration_fpr_target': None if self.multiclass else self.max_fpr,
+                'benign_loss_weight': None if self.multiclass else self.benign_cost}
