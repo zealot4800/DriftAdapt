@@ -86,7 +86,8 @@ module driftadapt_u55c_250mhz #(
  .stage_index(stage_index),.stage_data(stage_data),.commit(commit),.loaded(loaded),
  .updating(updating),.staged_words(staged_words),.model_version(model_version),.errors(errors),
  .s_axis_tdata(generated),.s_axis_tvalid(generated_valid && hist_ready),.s_axis_tready(dnn_ready),
- .m_axis_tdata(classified),.m_axis_tvalid(classified_valid),.m_axis_tready(window_ready));
+ // Hold a closing-window result until its pipelined TV scan is complete.
+ .m_axis_tdata(classified),.m_axis_tvalid(classified_valid),.m_axis_tready(window_ready && hist_ready));
     wire [31:0] jtag_awaddr;
     wire [2:0] jtag_awprot;
     wire jtag_awvalid;
@@ -124,7 +125,7 @@ module driftadapt_u55c_250mhz #(
 
  driftadapt_window_manager #(.WINDOW_SIZE(WINDOW_SIZE),.SAMPLE_COUNT(SAMPLE_COUNT)) windows(
  .clk(axis_aclk),.rst_n(axis_aresetn),.s_axis_tdata(classified),
- .s_axis_tvalid(classified_valid),.s_axis_tready(window_ready),
+ .s_axis_tvalid(classified_valid && hist_ready),.s_axis_tready(window_ready),
  .drift(drift),.loaded(loaded),.updating(updating),.staged_words(staged_words),
  .model_version(model_version),.model_errors(errors),.update_begin(update_begin),
  .stage_valid(stage_valid),.commit(commit),.stage_index(stage_index),.stage_data(stage_data),.status(status),

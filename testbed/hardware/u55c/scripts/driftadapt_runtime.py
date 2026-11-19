@@ -155,9 +155,16 @@ class Runtime:
         tn = int(((y == 0) & (p == 0)).sum())
         fp = int(((y == 0) & (p == 1)).sum())
         fn = int(((y == 1) & (p == 0)).sum())
-        return dict(samples=len(y), true_positive=tp, true_negative=tn,
+        attack_f1 = 2*tp/max(2*tp+fp+fn, 1)
+        benign_f1 = 2*tn/max(2*tn+fp+fn, 1)
+        return dict(samples=len(y), accuracy=(tp+tn)/max(len(y),1),
+                    macro_f1=(attack_f1+benign_f1)/2,
+                    true_positive=tp, true_negative=tn,
                     false_positive=fp, false_negative=fn,
-                    anomaly_f1=2*tp/max(2*tp+fp+fn, 1),
+                    anomaly_f1=attack_f1,
                     false_positive_rate=fp/max(tn+fp, 1),
                     recall=tp/max(tp+fn, 1), adaptation_count=self.method.version,
-                    verified_feedback=self.method.feedback_count)
+                    rejected_candidates=self.method.rejected,
+                    verified_feedback=self.method.feedback_count,
+                    window_accuracy=[float((y[i:i+self.size] == p[i:i+self.size]).mean())
+                                     for i in range(0, len(y), self.size)])

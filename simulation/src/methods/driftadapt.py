@@ -76,14 +76,15 @@ class DriftAdapt:
 
     def __init__(self, config, output):
         self.config = config
-        task = config.get('driftadapt', {}).get('task', 'anomaly')
+        section = config.get('driftadapt') or {}
+        task = section.get('task', 'anomaly')
         if task not in ('anomaly', 'multiclass'):
             raise ValueError('driftadapt.task must be anomaly or multiclass')
         self.multiclass = task == 'multiclass'
         self.num_classes = config['dataset']['num_classes'] if self.multiclass else 2
         self.evaluation_target = 'original_class_id' if self.multiclass else 'anomaly'
         self.benign = None if self.multiclass else benign_classes(config, required=True)
-        self.max_fpr = float(config.get('driftadapt', {}).get('max_false_positive_rate', 0.15))
+        self.max_fpr = float(section.get('max_false_positive_rate', 0.15))
         if not 0 <= self.max_fpr <= 1:
             raise ValueError('driftadapt.max_false_positive_rate must be between zero and one')
         self.benign_cost = 1.0
@@ -93,9 +94,49 @@ class DriftAdapt:
         if self.multiclass:
             self.architecture = 'multiclass_histogram_quantized_mlp_v1'
             self.checkpoint = self.checkpoint.with_name(f"{config['dataset']['name']}-driftadapt-multiclass-v1.pt")
+        # Online adaptation policy. Every default reproduces the original behaviour.
+        adapt = dict(section.get('adapt') or {})
+        self.adapt_settings = {'min_labels': int(adapt.get('min_labels', 32)),
+                               'drift_min_labels': int(adapt.get('drift_min_labels', 8)),
+                               'epochs': adapt.get('epochs'), 'learning_rate': adapt.get('learning_rate'),
+                               'gate': adapt.get('gate', 'none'), 'gate_samples': int(adapt.get('gate_samples', 32)),
+                               # Candidate must make at least gate_margin fewer hold-out errors.
+                               'gate_margin': int(adapt.get('gate_margin', 0)),
+                               # Online updates must optimise the objective the deployed model was
+                               # selected with; dropping distillation collapses the model.
+                               'distill': bool(adapt.get('distill', True)),
+                               'feedback_repeat': adapt.get('feedback_repeat', 1),
+                               # Re-fit the evidence LUT from source + verified counts with the
+                               # source bin boundaries fixed. Covariate drift lands in bins the
+                               # source never populated; MLP training alone cannot recover it.
+                               'refit_encoder': bool(adapt.get('refit_encoder', False)),
+                               # Weight of one verified flow in the LUT counts (integer or balance).
+                               'encoder_feedback_weight': adapt.get('encoder_feedback_weight', 1),
+                               # Decision threshold recalibration data: the offline calibration half
+                               # only, or that plus the verified feedback used for training.
+                               'threshold_source': adapt.get('threshold_source', 'calibration')}
+        if self.adapt_settings['threshold_source'] not in ('calibration', 'calibration+feedback'):
+            raise ValueError('driftadapt.adapt.threshold_source must be calibration or calibration+feedback')
+        # canary: commit the candidate, keep the previous model as a shadow on the host,
+        # compare both on the next canary_samples verified labels (which neither trained
+        # on) and re-commit the previous image if the new one is worse by gate_margin.
+        self.adapt_settings['canary_samples'] = int(adapt.get('canary_samples', 32))
+        if self.adapt_settings['gate'] not in ('none', 'holdout', 'canary'):
+            raise ValueError('driftadapt.adapt.gate must be none, holdout or canary')
+        self.shadow = None
+        self.canary = []
+        self.rollbacks = 0
+        for key in ('feedback_repeat', 'encoder_feedback_weight'):
+            value = self.adapt_settings[key]
+            if value != 'balance' and (type(value) is not int or value < 1):
+                raise ValueError(f'driftadapt.adapt.{key} must be a positive integer or balance')
+        if min(self.adapt_settings['min_labels'], self.adapt_settings['drift_min_labels'],
+               self.adapt_settings['gate_samples']) < 1:
+            raise ValueError('driftadapt.adapt label counts must be positive')
         self.pending = {}
         self.feedback = deque(maxlen=2048)
         self.version = self.update_bytes = self.feedback_count = self.new_feedback = self.streak = 0
+        self.rejected = 0
 
     def _schema(self, data):
         return {'architecture': self.architecture, 'preprocessing_id': data.preprocessing_id,
@@ -130,21 +171,24 @@ class DriftAdapt:
     def _encode(self, features):
         return self.encoder_table[np.arange(len(self.encoder_table)), self._encoder_indices(features)]
 
+    def _encoder_counts(self, features, labels):
+        """Per-class bin counts [classes, features, bins] with the fixed source bin boundaries."""
+        indices = np.clip(np.floor((features - self.encoder_minimum) * self.encoder_inverse_width),
+                          0, self.encoder_bins - 1).astype(np.int64)
+        return np.stack([self._counts(indices[labels == label], self.encoder_bins)
+                         for label in range(self.num_classes)])
+
+    def _table_from_counts(self, counts):
+        probability = (counts + 1) / (counts.sum(axis=2, keepdims=True) + self.encoder_bins)
+        if self.multiclass:
+            return np.log(probability).transpose(1, 0, 2).reshape(-1, self.encoder_bins).astype(np.float32)
+        return np.log(probability[1] / probability[0]).astype(np.float32)
+
     def _fit_encoder(self, features, labels):
         self.encoder_minimum = features.min(axis=0)
         span = np.ptp(features, axis=0)
         self.encoder_inverse_width = self.encoder_bins / np.where(span > 0, span, 1)
-        indices = np.clip(np.floor((features - self.encoder_minimum) * self.encoder_inverse_width),
-                          0, self.encoder_bins - 1).astype(np.int64)
-        if self.multiclass:
-            counts = np.stack([self._counts(indices[labels == label], self.encoder_bins)
-                               for label in range(self.num_classes)])
-            probability = (counts + 1) / (counts.sum(axis=2, keepdims=True) + self.encoder_bins)
-            self.encoder_table = np.log(probability).transpose(1, 0, 2).reshape(-1, self.encoder_bins).astype(np.float32)
-            return
-        counts = np.stack([self._counts(indices[labels == label], self.encoder_bins) for label in (0, 1)])
-        probability = (counts + 1) / (counts.sum(axis=2, keepdims=True) + self.encoder_bins)
-        self.encoder_table = np.log(probability[1] / probability[0]).astype(np.float32)
+        self.encoder_table = self._table_from_counts(self._encoder_counts(features, labels))
 
     @torch.no_grad()
     def _export(self):
@@ -211,8 +255,10 @@ class DriftAdapt:
                 'false_positive_rate': float(prediction[labels == 0].mean()),
                 'recall': float(prediction[labels == 1].mean())}
 
-    def _fit(self, encoded, labels, epochs, optimizer=None, distill=True):
-        settings = self.config['training']
+    def _fit(self, encoded, labels, epochs, optimizer=None, distill=True, learning_rate=None):
+        settings = dict(self.config['training'])
+        if learning_rate is not None:
+            settings['learning_rate'] = float(learning_rate)
         criterion = None
         if distill and self.distillation_weight > 0:
             extra = self.distillation_features
@@ -374,8 +420,10 @@ class DriftAdapt:
     def prepare(self, data):
         self._load(data)
         source = data.features[0].cpu().numpy()
+        self.source_raw = source
         self.source = torch.as_tensor(self._encode(source), device=data.device)
         self.source_labels = torch.as_tensor(self._labels(data.labels[0].cpu().numpy()), device=data.device)
+        self.source_counts = self._encoder_counts(source, self.source_labels.cpu().numpy())
         self.bins = int(self.config['drift']['bins'])
         self.minimum = source.min(axis=0)
         span = np.ptp(source, axis=0)
@@ -404,30 +452,117 @@ class DriftAdapt:
             if sample_id in observation['feedback_sample_ids']:
                 self.pending[sample_id] = self.features[offset].copy()
         for record in observation['feedback']:
-            self.feedback.append((self.pending.pop(record['sample_id']), int(self._labels([record['label']])[0])))
+            item = (self.pending.pop(record['sample_id']), int(self._labels([record['label']])[0]))
+            self.feedback.append(item)
+            if self.shadow is not None:
+                self.canary.append(item)
         released = len(observation['feedback'])
         self.feedback_count += released
         self.new_feedback += released
-        adapted = self.new_feedback >= (8 if active else 32)
+        settings = self.adapt_settings
+        gated = settings['gate'] == 'holdout'
+        adapted = False
         size = 0
-        if adapted:
-            features, labels = zip(*self.feedback)
+        gate = {}
+        if self.shadow is not None and len(self.canary) >= settings['canary_samples']:
+            features, labels = map(np.stack, zip(*self.canary))
+            gate['canary_samples'] = len(labels)
+            gate['canary_new_errors'] = int((self._predict(features) != labels).sum())
+            gate['canary_old_errors'] = int((self._predict_with(self.shadow, features) != labels).sum())
+            if gate['canary_new_errors'] > gate['canary_old_errors'] + settings['gate_margin']:
+                self._restore(self.shadow)
+                self.rollbacks += 1
+                adapted, size = True, self.parameter_bytes
+                self.version += 1
+                self.update_bytes += size
+                gate['rollback'] = True
+            self.shadow, self.canary = None, []
+        due = self.new_feedback >= (settings['drift_min_labels'] if active else settings['min_labels'])
+        # A gated candidate is judged on the freshest verified labels, which it has
+        # not trained on. They join the training buffer once newer labels arrive.
+        holdout = settings['gate_samples'] if gated else 0
+        trained = due and len(self.feedback) > holdout and self.shadow is None and not gate.get('rollback')
+        if trained:
+            records = list(self.feedback)
+            features, labels = zip(*records[:len(records) - holdout])
             device = self.source.device
-            x = torch.cat((self.source, torch.as_tensor(self._encode(np.stack(features)), device=device)))
-            y = torch.cat((self.source_labels, torch.as_tensor(labels, device=device)))
+            repeat = settings['feedback_repeat']
+            repeat = max(1, len(self.source) // len(features)) if repeat == 'balance' else repeat
+            features, labels = np.stack(features), np.asarray(labels, dtype=np.int64)
+            saved = (copy.deepcopy(self.model.state_dict()), self.threshold, self.encoder_table,
+                     self.packed, self.input_table)
+            if gated:
+                held_features, held_labels = map(np.stack, zip(*records[len(records) - holdout:]))
+                gate['gate_holdout_samples'] = holdout
+                gate['gate_current_errors'] = int((self._predict(held_features) != held_labels).sum())
+            if settings['refit_encoder']:
+                weight = settings['encoder_feedback_weight']
+                weight = repeat if weight == 'balance' else weight
+                self._set_encoder_table(self._table_from_counts(
+                    self.source_counts + weight * self._encoder_counts(features, labels)))
+            encoded = torch.as_tensor(self._encode(features), device=device).repeat(repeat, 1)
+            x = torch.cat((self.source, encoded))
+            y = torch.cat((self.source_labels, torch.as_tensor(labels, device=device).repeat(repeat)))
+            epochs = settings['epochs'] or max(1, self.config['training']['epochs'] // 3)
             torch.manual_seed(self.config['runtime']['seed'] + self.version + 1)
-            self._fit(x, y, max(1, self.config['training']['epochs'] // 3), distill=False)
+            self._fit(x, y, int(epochs), distill=settings['distill'], learning_rate=settings['learning_rate'])
             self._export()
-            self.threshold = self._threshold(self._scores(self.calibration), self.calibration_labels)
-            size = self.parameter_bytes
-            self.version += 1
-            self.update_bytes += size
+            calibration, calibration_labels = self.calibration, self.calibration_labels
+            if settings['threshold_source'] == 'calibration+feedback':
+                calibration = np.concatenate((calibration, np.repeat(features, repeat, axis=0)))
+                calibration_labels = np.concatenate((calibration_labels, np.repeat(labels, repeat)))
+            self.threshold = self._threshold(self._scores(calibration), calibration_labels)
+            adapted = True
+            if gated:
+                gate['gate_candidate_errors'] = int((self._predict(held_features) != held_labels).sum())
+                adapted = gate['gate_candidate_errors'] + settings['gate_margin'] <= gate['gate_current_errors']
+                if not adapted:
+                    # Roll back: the deployed model is never replaced by a worse one.
+                    self._restore(saved)
+                    self.rejected += 1
+            if adapted:
+                size = self.parameter_bytes
+                self.version += 1
+                self.update_bytes += size
+                if settings['gate'] == 'canary':
+                    self.shadow, self.canary = saved, []
             self.new_feedback = 0
-        return {'adapted': adapted, 'model_update_bytes': size, 'verified_feedback_applied': released,
-                'feature_drift_detected': active, 'drift_metric': 'total_variation', 'drift_threshold': threshold}
+        return {'adapted': adapted, 'candidate_trained': trained, 'model_update_bytes': size,
+                'verified_feedback_applied': released, 'feature_drift_detected': active,
+                'drift_metric': 'total_variation', 'drift_threshold': threshold, **gate}
+
+    def _set_encoder_table(self, table):
+        self.encoder_table = table
+        device = self.source.device
+        self.source = torch.as_tensor(self._encode(self.source_raw), device=device)
+        self.distillation_features = torch.as_tensor(self._encode(self.calibration), device=device)
+
+    def _restore(self, saved):
+        self.model.load_state_dict(saved[0])
+        self.model.eval()
+        self.threshold = saved[1]
+        if self.encoder_table is not saved[2]:
+            self._set_encoder_table(saved[2])
+        self._export()
+
+    def _predict(self, features):
+        scores = self._scores(features)
+        return scores.argmax(axis=1) if self.multiclass else (scores >= self.threshold).astype(np.int64)
+
+    def _predict_with(self, saved, features):
+        """Predictions of a saved (shadow) model image, without disturbing the deployed one."""
+        current = self.packed, self.input_table, self.threshold, self.encoder_table
+        self.packed, self.input_table, self.threshold = saved[3], saved[4], saved[1]
+        self.encoder_table = saved[2]
+        try:
+            return self._predict(features)
+        finally:
+            self.packed, self.input_table, self.threshold, self.encoder_table = current
 
     def state(self):
         return {'architecture': self.architecture, 'adaptation_count': self.version,
+                'rejected_candidates': self.rejected, 'rollbacks': self.rollbacks,
+                'adaptation_policy': self.adapt_settings,
                 'labeling_cost_samples': self.feedback_count, 'labeling_seconds': None,
                 'model_update_bytes': self.update_bytes, 'layers': [len(self.encoder_table), 16, 8, self.num_classes],
                 'weight_bits': 8, 'bias_bits': 32, 'activation_bits': 8,

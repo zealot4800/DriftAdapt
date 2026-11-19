@@ -82,18 +82,7 @@ class ID_UNSW_NB15_N3IC(InferenceModel):
         return self.model(x)
 
 
-class UNSW_IoT_N3IC(InferenceModel):
-    def __init__(self, input_shape: int = 16, neurons: list[int] | None = None) -> None:
-        super().__init__()
-        neurons = neurons or [64, 32, 10]
-        self.model = _two_hidden_stack(input_shape, neurons[0], neurons[1], neurons[2])
-        self.model.apply(_init_weights)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
-
-
-MODEL_REGISTRY = {cls.__name__: cls for cls in (ID_CIC_IDS2017_small_pforest, ID_CIC_IDS2017_large_pforest, ID_UNSW_NB15_N3IC, UNSW_IoT_N3IC)}
+MODEL_REGISTRY = {cls.__name__: cls for cls in (ID_CIC_IDS2017_small_pforest, ID_CIC_IDS2017_large_pforest, ID_UNSW_NB15_N3IC)}
 
 
 def build_model(name: str, kwargs: dict[str, Any] | None = None) -> InferenceModel:

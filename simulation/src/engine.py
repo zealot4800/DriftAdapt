@@ -43,7 +43,7 @@ def observations(config, data):
 def evaluate(config, data, method, destination):
     method.prepare(data)
     feedback = ReleasedFeedback(config, len(data.labels[2])//config['stream']['window_size']*config['stream']['window_size'])
-    benign = None if config['dataset'].get('task') == 'device_classification' else benign_classes(config)
+    benign = benign_classes(config)
     anomaly_target = getattr(method, 'evaluation_target', None) == 'anomaly'
     expected, predicted = [], []
     anomaly_expected, anomaly_predicted = [], []

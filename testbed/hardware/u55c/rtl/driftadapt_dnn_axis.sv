@@ -11,7 +11,7 @@ module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem")
 );
  localparam BOOT=0, IDLE=1, ENCODE=2, BEGIN_NEURON=3, OPERANDS=4,
             MAC=5, STORE=6, COPY=7, OUTPUT_PACKET=8,
-            QSUM=9, QFULL=10, QROUND=11, ACTIVATE=12;
+            QSUM=9, QFULL=10, QROUND=11, ACTIVATE=12, LOAD_MULTIPLIER=13;
  reg [3:0] state;
  reg [31:0] rom[0:384];
  reg [31:0] bank0[0:384], bank1[0:384];
@@ -34,18 +34,39 @@ module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem")
  wire [8:0] bias_offset=layer==0 ? 356 : (layer==1 ? 372 : 380);
  wire [10:0] lut_index=feature_index*64+packet[(14+feature_index)*8 +: 8];
  wire [10:0] weight_index=weight_offset+(layer==2 ? neuron*8 : neuron*16)+feature_index;
- wire [31:0] lut_word=active ? bank1[lut_index/4] : bank0[lut_index/4];
- wire [31:0] weight_word=active ? bank1[weight_index/4] : bank0[weight_index/4];
- wire signed [7:0] lut_byte=lut_word[(lut_index%4)*8 +: 8];
- wire signed [7:0] weight_byte=weight_word[(weight_index%4)*8 +: 8];
- wire signed [31:0] bias_word=active ? bank1[bias_offset+neuron] : bank0[bias_offset+neuron];
- wire [31:0] multiplier_word=active ? bank1[382+layer] : bank0[382+layer];
- wire signed [31:0] threshold_word=active ? bank1[384] : bank0[384];
+ // One asynchronous model read port; inference states select the word.
+ reg [8:0] model_read_address;
+ always @* begin
+   model_read_address=9'd384;
+   case(state)
+     ENCODE:model_read_address=lut_index[10:2];
+     BEGIN_NEURON:model_read_address=bias_offset+neuron;
+     LOAD_MULTIPLIER:model_read_address=382+layer;
+     OPERANDS:model_read_address=weight_index[10:2];
+     default:model_read_address=9'd384;
+   endcase
+ end
+ wire [31:0] model_word=active ? bank1[model_read_address] : bank0[model_read_address];
+ wire signed [7:0] lut_byte=model_word[(lut_index%4)*8 +: 8];
+ wire signed [7:0] weight_byte=model_word[(weight_index%4)*8 +: 8];
+ wire signed [31:0] bias_word=model_word;
+ wire [31:0] multiplier_word=model_word;
+ wire signed [31:0] threshold_word=model_word;
  wire signed [63:0] margin=accumulator-first_logit;
  initial $readmemh(WEIGHT_MEM_FILE, rom);
  assign s_axis_tready=loaded && state==IDLE && !updating && !pending && !update_begin && !commit;
  assign m_axis_tvalid=state==OUTPUT_PACKET;
  assign m_axis_tdata=packet;
+ // One mutually exclusive write port per model bank, including boot reload.
+ always @(posedge clk) begin
+   if(rst_n) begin
+     if(state==BOOT) begin
+       bank0[boot_index]<=rom[boot_index];bank1[boot_index]<=rom[boot_index];
+     end else if(stage_valid && updating && !pending && stage_index<385) begin
+       if(active) bank0[stage_index]<=stage_data;else bank1[stage_index]<=stage_data;
+     end
+   end
+ end
  always @(posedge clk) begin
    if(!rst_n) begin
      state<=BOOT; boot_index<=0; loaded<=0; active<=0; pending<=0;
@@ -59,7 +80,6 @@ module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem")
      end
      if(stage_valid) begin
        if(updating && !pending && stage_index<385) begin
-         if(active) bank0[stage_index]<=stage_data; else bank1[stage_index]<=stage_data;
          if(!written[stage_index]) staged_words<=staged_words+1'b1;
          written[stage_index]<=1;
        end else errors[0]<=1;
@@ -70,7 +90,6 @@ module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem")
      end
      case(state)
        BOOT: begin
-         bank0[boot_index]<=rom[boot_index]; bank1[boot_index]<=rom[boot_index];
          if(boot_index==384) begin loaded<=1; state<=IDLE; end
          else boot_index<=boot_index+1;
        end
@@ -89,8 +108,10 @@ module driftadapt_dnn_axis #(parameter WEIGHT_MEM_FILE="driftadapt_weights.mem")
          else feature_index<=feature_index+1;
        end
        BEGIN_NEURON: begin
-         accumulator<=bias_word; feature_index<=0; state<=OPERANDS;
-         requant_multiplier<=multiplier_word;
+         accumulator<=bias_word; feature_index<=0; state<=LOAD_MULTIPLIER;
+       end
+       LOAD_MULTIPLIER: begin
+         requant_multiplier<=multiplier_word;state<=OPERANDS;
        end
        OPERANDS: begin
          operand_a<=activation[feature_index];

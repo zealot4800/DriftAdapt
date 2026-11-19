@@ -56,7 +56,7 @@ if [[ "$mode" == "implement" || "$mode" == "all" ]]; then
     "$vivado_bin" -mode batch -nojournal -nolog -notrace \
         -source "$hardware_root/scripts/implement_u55c.tcl" \
         -tclargs "$project" "$hardware_root/build/encoded_mlp_v5" || implementation_status=$?
-    if [[ "$mode" == "implement" ]]; then
+    if [[ ( "$implementation_status" -ne 0 && "$implementation_status" -ne 2 ) || "$mode" == "implement" ]]; then
         exit "$implementation_status"
     fi
     [[ -s "$routed_dcp" ]] || {
@@ -70,6 +70,13 @@ if [[ "$mode" == "close" || "$mode" == "all" ]]; then
         echo "routed checkpoint is missing: $routed_dcp" >&2
         exit 1
     }
+    while IFS= read -r design_source; do
+        [[ "$routed_dcp" -nt "$design_source" ]] || {
+            echo "routed checkpoint is stale relative to $design_source; run build_u55c.sh all" >&2
+            exit 1
+        }
+    done < <(find "$hardware_root/rtl" "$hardware_root/plugin" "$hardware_root/assets" \
+        -type f \( -name '*.sv' -o -name '*.tcl' -o -name '*.mem' -o -name '*.vh' \) -print)
     "$vivado_bin" -mode batch -nojournal -nolog -notrace \
         -source "$hardware_root/scripts/close_timing_u55c.tcl" \
         -tclargs "$routed_dcp" "$closure_dir"

@@ -51,3 +51,6 @@ testbed/results/
 *.pid.lock
 *.tmp
 *.bak
+docs/*
+baselines/*
+archive/*

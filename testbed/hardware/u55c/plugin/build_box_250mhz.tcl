@@ -1,7 +1,16 @@
 set plugin_root [file dirname [file normalize [info script]]]
 set hardware_root [file normalize [file join $plugin_root ..]]
 
-set_property include_dirs [concat [get_property include_dirs [current_fileset]] [list [file join $hardware_root assets]]] [current_fileset]
+# OpenNIC restores its include_dirs variable after sourcing this hook. Update
+# that list as well as the fileset so the generated header survives the restore.
+set driftadapt_asset_dir [file join $hardware_root assets]
+if {![info exists include_dirs]} {
+    set include_dirs [get_property include_dirs [current_fileset]]
+}
+if {[lsearch -exact $include_dirs $driftadapt_asset_dir] < 0} {
+    lappend include_dirs $driftadapt_asset_dir
+}
+set_property include_dirs $include_dirs [current_fileset]
 foreach memory_file {driftadapt_weights.mem driftadapt_samples.mem driftadapt_reference.mem} {
     set memory_path [file join $hardware_root assets $memory_file]
     if {![file exists $memory_path]} { error "Missing DRIFTADAPT memory image: $memory_path" }

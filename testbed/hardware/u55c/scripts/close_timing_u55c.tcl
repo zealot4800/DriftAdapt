@@ -8,19 +8,28 @@ file mkdir $output_dir
 if {![file exists $routed_dcp]} { error "Routed checkpoint is missing: $routed_dcp" }
 
 open_checkpoint $routed_dcp
-puts "DRIFTADAPT_CLOSURE_INITIAL_WNS=[get_property SLACK [lindex [get_timing_paths -delay_type max -max_paths 1] 0]]"
+set initial_wns [get_property SLACK [lindex [get_timing_paths -delay_type max -max_paths 1] 0]]
+set initial_whs [get_property SLACK [lindex [get_timing_paths -delay_type min -max_paths 1] 0]]
+puts "DRIFTADAPT_CLOSURE_INITIAL_WNS=$initial_wns"
 
-# The first implementation is fully routed but its remaining setup paths are
-# in the stock QDMA aligner. Use Vivado's post-route critical-path replication
-# and an aggressive incremental reroute before accepting a hardware image.
-phys_opt_design -directive AggressiveExplore
-route_design -directive AggressiveExplore
-phys_opt_design -directive AggressiveExplore
-route_design -directive AggressiveExplore
+# Optimize the routed design before accepting an image. The full shell also
+# contains high-fanout QDMA control paths, beyond the DriftAdapt datapath.
+if {$initial_wns < 0.0 || $initial_whs < 0.0} {
+    phys_opt_design -directive AggressiveExplore
+    route_design -directive AggressiveExplore
+    phys_opt_design -directive AggressiveExplore
+    route_design -directive AggressiveExplore
+}
 
 report_timing_summary -delay_type min_max -max_paths 30 \
     -file [file join $output_dir timing.txt]
 report_bus_skew -file [file join $output_dir bus_skew.txt]
+set bus_skew_file [open [file join $output_dir bus_skew.txt] r]
+set bus_skew_report [read $bus_skew_file]
+close $bus_skew_file
+if {[regexp -nocase {\mVIOLATED\M} $bus_skew_report]} {
+    error "Bus-skew constraints failed; see $output_dir/bus_skew.txt"
+}
 report_utilization -file [file join $output_dir utilization.txt]
 report_drc -file [file join $output_dir drc.txt]
 set route_report [report_route_status -return_string]

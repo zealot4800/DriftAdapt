@@ -48,10 +48,13 @@ while IFS= read -r design_source; do
 done < <(find "$hardware_root/rtl" "$hardware_root/plugin" "$hardware_root/assets" \
     -type f \( -name '*.sv' -o -name '*.tcl' -o -name '*.mem' -o -name '*.json' -o -name '*.vh' \) \
     -print)
-for report in timing.txt route_status.txt drc.txt; do
+for report in timing.txt bus_skew.txt route_status.txt drc.txt; do
     [[ -s "$report_dir/$report" ]] ||
         die "validated implementation report is missing: $report_dir/$report"
 done
+if grep -Eiq '\bVIOLATED\b' "$report_dir/bus_skew.txt"; then
+    die "bus-skew report contains a timing violation: $report_dir/bus_skew.txt"
+fi
 grep -Fq 'All user specified timing constraints are met.' "$report_dir/timing.txt" ||
     die "timing report does not show timing closure: $report_dir/timing.txt"
 grep -Eq '# of nets with routing errors[.]+ :[[:space:]]+0 :' "$report_dir/route_status.txt" ||
