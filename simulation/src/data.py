@@ -56,7 +56,7 @@ class FlowData:
         names = [name.strip().lower() for name in self.feature_names]
         if section.get('packet_file'):
             raise ValueError('The simulation supports flow CSV datasets only')
-        frames = [pd.read_csv(path_for(config, value)) for value in section['files']]
+        frames = [pd.read_csv(path_for(config, value), low_memory=False) for value in section['files']]
         frame = pd.concat(frames, ignore_index=True)
         frame.columns = frame.columns.str.strip().str.lower()
         if 'total packet length' in names and 'total packet length' not in frame:

@@ -4,6 +4,7 @@
 .venv/
 venv/
 env/
+dataset/*
 __pycache__/
 *.py[cod]
 *$py.class
@@ -54,3 +55,6 @@ testbed/results/
 docs/*
 baselines/*
 archive/*
+
+# raw downloaded datasets (tens of GB)
+dataset/
