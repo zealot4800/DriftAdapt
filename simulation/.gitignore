@@ -4,6 +4,4 @@ __pycache__/
 *.py[cod]
 results/
 checkpoint/
-configs/dsn/
-feedback/*-b100-*.jsonl
-feedback/*
+tests/*

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
 import time
@@ -7,15 +8,14 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import torch
-from ..models import build_model, load_checkpoint, form_training_set, retrain_model
+from ..models import form_training_set, fit_model, train_classifier
 from ..drift import RetrainingTrigger
 from ..metrics import macro_f1
 
 ABSTAIN = -1
 
 
-def _label_batches(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
-    del generated_labels
+def _label_batches(self, features, raw_features=None) -> torch.Tensor:
     values = raw_features if raw_features is not None else features
     rows = values.detach().cpu().tolist()
     labels: list[int] = []
@@ -27,22 +27,18 @@ def _label_batches(self, features, raw_features=None, generated_labels=None) -> 
 
 
 class DNNLabeler:
-    def __init__(self, config: dict[str, Any], device: torch.device) -> None:
-        self.model = build_model(config["class"], config.get("kwargs")).to(device)
-        load_checkpoint(self.model, config["checkpoint"], device)
-        self.model.eval()
+    def __init__(self, model):
+        self.model = model
 
     @torch.inference_mode()
-    def label(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
-        del raw_features, generated_labels
+    def label(self, features, raw_features=None):
         return self.model.run_inference(features)[1]
 
 
 class OllamaLabeler:
     """Local LLM labeler backed by Ollama; no cloud API is used."""
 
-    def __init__(self, config: dict[str, Any], device: torch.device) -> None:
-        del device
+    def __init__(self, config: dict[str, Any]) -> None:
         self.host = config.get("host", "http://127.0.0.1:11434").rstrip("/")
         self.model = config.get("model", "llama2:7b")
         self.timeout = float(config.get("timeout", 300))
@@ -83,15 +79,14 @@ class OllamaLabeler:
         try:
             output = json.loads(result["message"]["content"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Invalid structured response from {self.model}: {result}") from exc
-        return _validate_labels(output.get("labels"), len(rows), self.model)
+            raise RuntimeError(f"Invalid structured response from {self.model}") from exc
+        return _validate_labels(output.get("labels") if isinstance(output, dict) else None, len(rows), self.model)
 
 
 class OpenAILabeler:
     """Cloud labeler using OpenAI's Responses API and strict structured output."""
 
-    def __init__(self, config: dict[str, Any], device: torch.device) -> None:
-        del device
+    def __init__(self, config: dict[str, Any]) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required when labeler.type is 'openai'")
@@ -101,7 +96,6 @@ class OpenAILabeler:
         self.batch_size = int(config.get("batch_size", 10))
         self.max_retries = int(config.get("max_retries", 3))
         self.feature_names = config.get("feature_names", [])
-        self.seed = int(config.get("seed", 42))
         if self.batch_size < 1 or self.max_retries < 0:
             raise ValueError("OPENAI_BATCH_SIZE must be positive and OPENAI_MAX_RETRIES nonnegative")
 
@@ -117,7 +111,7 @@ class OpenAILabeler:
                 {"role": "user", "content": _classification_prompt(rows, self.feature_names)},
             ],
             "text": {"format": {
-                "type": "json_schema", "name": "flow_labels", "strict": True, "schema": schema,
+                "type": "json_schema", "name": "window_labels", "strict": True, "schema": schema,
             }},
             "max_output_tokens": max(128, len(rows) * 24),
         }
@@ -148,19 +142,19 @@ class OpenAILabeler:
             output = json.loads(content)
         except (KeyError, StopIteration, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"OpenAI model {self.model} returned no valid label output") from exc
-        return _validate_labels(output.get("labels"), len(rows), self.model)
+        return _validate_labels(output.get("labels") if isinstance(output, dict) else None, len(rows), self.model)
 
 
 def _classification_prompt(rows: list[list[float]], feature_names: list[str]) -> str:
     header = ",".join(feature_names) if feature_names else "features"
-    flow_lines = "\n".join(
+    window_lines = "\n".join(
         f"{index}: " + ",".join(f"{value:.8g}" for value in row)
         for index, row in enumerate(rows, start=1)
     )
     return (
-        "Classify every network flow below. Label benign traffic 0 and "
-        "malicious traffic 1. Keep input order. Return exactly one label per flow "
-        f"in the required array.\nColumns: {header}\n{flow_lines}"
+        "Classify every packet window below. Label benign traffic 0 and "
+        "malicious traffic 1. Keep input order. Return exactly one label per window "
+        f"in the required array.\nColumns: {header}\n{window_lines}"
     )
 
 
@@ -177,123 +171,66 @@ def _labels_schema(count: int) -> dict[str, Any]:
 
 
 def _validate_labels(labels: Any, count: int, model: str) -> list[int]:
-    if not isinstance(labels, list) or len(labels) != count or any(label not in (0, 1) for label in labels):
-        raise RuntimeError(f"Expected {count} binary labels from {model}, received: {labels}")
+    if not isinstance(labels, list) or len(labels) != count or any(type(label) is not int or label not in (0, 1) for label in labels):
+        raise RuntimeError(f"Expected {count} binary labels from {model}")
     return [int(label) for label in labels]
 
 
-class FileLabeler:
-    """Precomputed teacher output, one label per evaluation row (sample_id, label).
-
-    Used for controlled experiments: an oracle teacher with a chosen error rate,
-    generated by make_feedback.py with --budget 1.0 --delay 0 --flip p. Rows are
-    looked up by the sample IDs of the current window; nothing else is read.
-    """
-    def __init__(self, config: dict[str, Any], device: torch.device) -> None:
-        del device
-        from ..config import path_for
-        self.labels = {}
-        for line in path_for(config['_config'], config['file']).read_text().splitlines():
-            record = json.loads(line)
-            self.labels[int(record['sample_id'])] = int(record['label'])
-        self.sample_ids = None
-
-    def label(self, features, raw_features=None, generated_labels=None) -> torch.Tensor:
-        del raw_features, generated_labels
-        if self.sample_ids is None or len(self.sample_ids) != len(features):
-            raise ValueError('file labeler needs the sample IDs of the labelled rows')
-        return torch.tensor([self.labels[int(i)] for i in self.sample_ids], dtype=torch.long, device=features.device)
-
-
-def build_labeler(config: dict[str, Any], device: torch.device):
+def build_labeler(config: dict[str, Any]):
     kind = config["type"].lower()
-    if kind == "dnn":
-        return DNNLabeler(config, device)
-    if kind == "file":
-        return FileLabeler(config, device)
     if kind in {"llm", "ollama"}:
-        return OllamaLabeler(config, device)
+        return OllamaLabeler(config)
     if kind == "openai":
-        return OpenAILabeler(config, device)
-    raise ValueError(f"Unsupported DRIFTADAPT labeler: {kind}")
-
+        return OpenAILabeler(config)
+    raise ValueError(f"Unsupported CARAVAN labeler: {kind}")
 
 
 class Caravan:
-    unit = 'flow'
+    unit = 'detection_window'
 
-    def __init__(self, config, output):
+    def __init__(self, config):
         self.config = config
+        self.buffer = deque(maxlen=config['stream']['buffer_windows'])
         self.version = 0
         self.optimizer = None
         self.teacher_samples = 0
-        self.labeling_seconds = 0.0
-        self.update_bytes = 0
 
     def train(self, data):
-        from ..models import prepare_student
-        prepare_student(self.config['model'], self.config, data, train=True)
-        if self.config['labeler']['type'] == 'dnn':
-            prepare_student(self.config['labeler'], self.config, data, train=True)
-        return {'source_training_rows': len(data.labels[0])}
-
-    def prepare(self, data):
-        from ..models import prepare_student
-        self.model = prepare_student(self.config['model'], self.config, data)
-        labeler = dict(self.config['labeler'], feature_names=data.feature_names, seed=self.config['runtime']['seed'],
-                       _config=self.config)
-        if labeler['type'] == 'dnn':
-            self.labeler = DNNLabeler.__new__(DNNLabeler)
-            self.labeler.model = prepare_student(labeler, self.config, data)
-        else:
-            if labeler['type'] in ('ollama', 'openai') and self.config['dataset']['num_classes'] != 2:
-                raise ValueError('The existing LLM teacher supports binary labels only')
-            self.labeler = build_labeler(labeler, data.device)
+        self.model = train_classifier(self.config['model'], self.config, data)
+        labeler = dict(self.config['labeler'], feature_names=data.feature_names,
+                       seed=self.config['runtime']['seed'])
+        self.labeler = (DNNLabeler(train_classifier(labeler, self.config, data))
+                        if labeler['type'] == 'dnn' else build_labeler(labeler))
         settings = self.config['trigger']
         self.trigger = RetrainingTrigger(settings['threshold'], drop_threshold=settings['drop_threshold'],
                                         consecutive_windows=settings['consecutive_windows'])
+        self.buffer.clear()
+        self.version = self.teacher_samples = 0
+        self.optimizer = None
 
     @torch.inference_mode()
     def infer(self, observation):
         return self.model.run_inference(observation['features'])[1]
 
     def adapt(self, observation, prediction):
-        started = time.perf_counter()
-        count = len(prediction)
-        budget = observation.get('label_budget')
-        if budget is not None:
-            count = min(count, budget)
-        if count == 0:
-            return {'adapted':False, 'teacher_samples':0, 'accepted_labels':0, 'model_update_bytes':0}
-        features = observation['features'][:count]
-        if isinstance(self.labeler, FileLabeler):
-            self.labeler.sample_ids = list(observation['sample_ids'])[:count]
-        produced = self.labeler.label(features, observation['raw_features'][:count], observation['generated_labels'][:count])
-        elapsed = time.perf_counter()-started
-        self.labeling_seconds += elapsed
-        self.teacher_samples += count
+        features = observation['features']
+        produced = self.labeler.label(features, observation['raw_features'])
+        self.teacher_samples += len(prediction)
+        if (produced.dtype != torch.long or produced.shape != prediction.shape
+                or not ((produced >= ABSTAIN) & (produced <= 1)).all()):
+            raise ValueError('Labeler must return one binary label or -1 per packet window')
         valid = produced != ABSTAIN
-        event = {'adapted': False, 'teacher_samples': count, 'accepted_labels': int(valid.sum()),
-                 'labeling_seconds': elapsed, 'model_update_bytes': 0}
         if not valid.any():
-            return event
-        proxy = macro_f1(produced[valid], prediction[:count][valid])
+            return
+        self.buffer.append((features[valid].detach().clone(), produced[valid].detach().clone(),
+                            prediction[valid].detach().clone()))
+        x, y, previous = (torch.cat([entry[index] for entry in self.buffer]) for index in range(3))
+        proxy = macro_f1(y, previous)
         requested = self.trigger.update(proxy)
-        settings = self.config['training']
-        x, y = form_training_set(features[valid], produced[valid],
-                                 balance_binary=settings['balance_binary'])
-        event['proxy_f1'] = proxy
+        x, y = form_training_set(x, y)
         if requested and x is not None:
-            elapsed, self.optimizer = retrain_model(self.model, x, y, epochs=settings['epochs'],
-                batch_size=settings['batch_size'], learning_rate=settings['learning_rate'],
-                optimizer_name=settings['optimizer'], optimizer=self.optimizer)
+            self.optimizer = fit_model(self.model, x, y, self.config['training'], optimizer=self.optimizer)
             self.version += 1
-            size = sum(p.numel() for p in self.model.parameters()) * self.config['runtime']['parameter_bits']
-            size = (size+7)//8
-            self.update_bytes += size
-            event.update(adapted=True, training_seconds=elapsed, model_update_bytes=size)
-        return event
 
     def state(self):
-        return {'adaptation_count': self.version, 'labeling_cost_samples': self.teacher_samples,
-                'labeling_seconds': self.labeling_seconds, 'model_update_bytes': self.update_bytes}
+        return {'adaptation_count': self.version, 'labeling_cost_samples': self.teacher_samples}
