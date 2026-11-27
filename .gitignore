@@ -55,6 +55,5 @@ testbed/results/
 docs/*
 baselines/*
 archive/*
-
-# raw downloaded datasets (tens of GB)
+*.pdf
 dataset/
